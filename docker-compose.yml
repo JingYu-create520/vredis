@@ -1,0 +1,13 @@
+services:
+  vredis:
+    build: .
+    image: vredis:0.2.0
+    ports:
+      - "6379:6379"
+    volumes:
+      # 具名 volume：容器重建/重启后 WAL 与快照不丢
+      - vredis-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  vredis-data:

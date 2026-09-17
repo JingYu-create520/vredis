@@ -12,7 +12,26 @@ cargo run          # 监听 127.0.0.1:6379，等待 RESP2 客户端连接
 ```
 
 - 默认监听 `127.0.0.1:6379`（仅本机回环）；端口被占用时打印明确提示并以退出码 1 退出，**绝不自动更换端口**。
-- 跑测试（145 个，含真实 TCP 端到端）：`cargo test`
+- 跑测试（169 个，含真实 TCP 端到端）：`cargo test`
+
+## Docker 部署
+
+```bash
+docker build -t vredis .
+docker run -d --name vredis -p 6379:6379 -v vredis-data:/app/data vredis
+```
+
+或使用 docker compose：
+
+```bash
+docker compose up -d
+docker compose logs -f
+```
+
+数据持久化：vredis 的 WAL 与快照写在**可执行文件所在目录下的 `data/`**（design.md §3.1），
+镜像内二进制位于 `/app/vredis`，因此挂载点为 **`/app/data`**——compose 使用具名 volume
+`vredis-data` 挂载，容器重建/重启数据不丢；BGSAVE 快照与启动恢复机制在容器内照常工作。
+容器以非 root 用户 `vredis` 运行（镜像内已预建 `/app/data` 并赋属主）。
 
 ## 支持的命令
 
@@ -29,6 +48,7 @@ cargo run          # 监听 127.0.0.1:6379，等待 RESP2 客户端连接
 | `KEYS pattern` | 通配符匹配（仅支持 `*` 与 `?`），返回顺序不保证 |
 | `TYPE key` | 返回 `string` / `vector` / `none`（`vector` 为本库扩展类型） |
 | `FLUSHALL` | 清空全部数据 |
+| `BGSAVE` | 触发一次快照并截断 WAL（v0.2.0 起；同步实现，无后台线程） |
 
 ### 向量命令（本库扩展）
 
@@ -115,7 +135,7 @@ S> -WRONGTYPE Operation against a key holding the wrong kind of value |
   `Cargo.toml` 的 `[dependencies]` 为空。
 - **锁纪律**：VSEARCH 的距离计算与 top-k 收集在存储层单次持锁回调内完成，
   绝不把整个索引克隆出锁外（对 10 万级向量索引是数量级差异）。
-- **测试文化**：145 个测试——协议层对 7 类消息做**所有截断前缀**的 Incomplete 断言、
+- **测试文化**：169 个测试——协议层对 7 类消息做**所有截断前缀**的 Incomplete 断言、
   恶意输入（`$1000000000`、`*2000000000`、65 层嵌套）防护测试、8 线程并发 KV 冒烟、
   4 线程并发 VADD 的 id 唯一性验证。
 
@@ -126,9 +146,8 @@ S> -WRONGTYPE Operation against a key holding the wrong kind of value |
 
 ## Roadmap / Known Limitations
 
-以下为记录在案的未来方向，MVP 均未实现：
+以下为记录在案的未来方向，当前均未实现：
 
-- 持久化（WAL + 快照）
 - HNSW 近似最近邻索引
 - Benchmark（10 万 / 100 万向量 QPS 与召回率）
 - 分片锁替代单把 Mutex

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 锁定与本地/Dockerfile 相同的工具链版本：
+      # 浮动 stable 会在未来 rustc 新增 lint 时打爆 -D warnings 门禁。
+      # action 用 @master + with.toolchain 指定版本（按版本打 tag 可能滞后）
+      - name: Install Rust toolchain (pinned 1.98.1)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      # 覆盖 cargo registry 与 target 的缓存
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test
+
+      - name: Clippy (zero warnings gate)
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Dockerfile 冒烟：本机无 Docker，靠 CI 防止 Dockerfile 腐坏。
+  # 仅 push 到 master 时跑（PR 不跑，不浪费资源）。
+  docker-build:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build docker image (smoke)
+        run: docker build -t vredis:ci .
