@@ -7,6 +7,7 @@
 pub mod command;
 pub mod config;
 pub mod net;
+pub mod persist;
 pub mod protocol;
 pub mod storage;
 pub mod vector;

@@ -6,13 +6,15 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
 use vredis::config::ServerConfig;
 use vredis::net::{accept_loop, bind};
+use vredis::persist::PersistConfig;
 use vredis::protocol::{parse, ParseOutcome, RespValue};
-use vredis::storage::Db;
+use vredis::storage::{Db, Value};
 
 /// 起一个临时端口的服务器，返回实际端口；accept 循环在后台线程运行。
 fn spawn_server() -> u16 {
@@ -22,6 +24,28 @@ fn spawn_server() -> u16 {
     let db = Arc::new(Db::new());
     thread::spawn(move || accept_loop(listener, db));
     port
+}
+
+/// 起一个真实 TCP 服务器（“进程 B”）：Db::open(dir) 恢复 + accept_loop，返回端口。
+fn spawn_server_with_dir(dir: PathBuf) -> u16 {
+    let (db, warnings) = Db::open(&PersistConfig { dir }).expect("open with recovery");
+    assert!(warnings.is_empty(), "unexpected recovery warnings: {warnings:?}");
+    let listener = bind(&ServerConfig { host: "127.0.0.1".to_string(), port: 0 })
+        .expect("bind on port 0 must succeed");
+    let port = listener.local_addr().expect("local_addr").port();
+    thread::spawn(move || accept_loop(listener, Arc::new(db)));
+    port
+}
+
+/// 唯一临时数据目录（测试辅助；幂等清理）。
+fn temp_data_dir(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("vredis-e2e-{}-{tag}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp data dir");
+    dir
 }
 
 /// 最小测试客户端：维护持久读缓冲，支持流水线场景下跨消息保留 leftover。
@@ -555,4 +579,71 @@ fn t36_pipelined_vadd_vsearch() {
     let (ids, dists) = flat_search_reply(c.read_reply());
     assert_eq!(ids, vec!["0"]);
     assert!(dists[0].abs() < 1e-12);
+}
+
+// —— 持久化全链路测试（进阶 1 v0.4）——
+
+#[test]
+fn t37_restart_persistence_full_tcp_chain() {
+    // 进程 A 模拟（纯文件层）：Db::open → SET / VADD → drop 释放 WAL 句柄
+    let dir = temp_data_dir("t37");
+    {
+        let (db, warnings) = Db::open(&PersistConfig { dir: dir.clone() }).expect("open A");
+        assert!(warnings.is_empty());
+        db.set("a", Value::Str(b"hello".to_vec())).expect("set a");
+        assert_eq!(db.vector_add("ix", vec![1.0, 0.0]).expect("add"), "0");
+        assert_eq!(db.vector_add("ix", vec![0.0, 1.0]).expect("add"), "1");
+    } // drop：释放 WAL 句柄，模拟进程退出
+    // 进程 B：真实 TCP 服务器（Db::open 恢复 + accept_loop），通过连接验证数据
+    let port = spawn_server_with_dir(dir);
+    let mut c = TestClient::connect(port);
+    // SET 的 key 拿到了
+    c.send(&resp(&["GET", "a"]));
+    assert_eq!(c.read_reply(), RespValue::Bulk(b"hello".to_vec()));
+    // VADD 的 id 拿到了
+    c.send(&resp(&["VGET", "ix", "0"]));
+    assert_eq!(
+        c.read_reply(),
+        RespValue::Array(vec![
+            RespValue::Bulk(b"1".to_vec()),
+            RespValue::Bulk(b"0".to_vec()),
+        ])
+    );
+    // next_id 续号正确：重启后新 VADD 拿 "2"
+    c.send(&resp(&["VADD", "ix", "2", "1.0", "1.0"]));
+    assert_eq!(c.read_reply(), RespValue::Bulk(b"2".to_vec()));
+}
+
+#[test]
+fn t38_bgsave_recovers_snapshot_plus_wal() {
+    // 进程 A 模拟：SET x → BGSAVE（x 进快照、WAL 截断）→ SET y（y 只在 WAL）→ drop
+    let dir = temp_data_dir("t38");
+    {
+        let (db, warnings) = Db::open(&PersistConfig { dir: dir.clone() }).expect("open A");
+        assert!(warnings.is_empty());
+        db.set("x", Value::Str(b"1".to_vec())).expect("set x");
+        db.bgsave().expect("bgsave");
+        db.set("y", Value::Str(b"2".to_vec())).expect("set y");
+    }
+    // 进程 B：真实 TCP 服务器（快照 + WAL 组合恢复）
+    let port = spawn_server_with_dir(dir);
+    let mut c = TestClient::connect(port);
+    c.send(&resp(&["GET", "x"]));
+    assert_eq!(c.read_reply(), RespValue::Bulk(b"1".to_vec())); // 来自快照
+    c.send(&resp(&["GET", "y"]));
+    assert_eq!(c.read_reply(), RespValue::Bulk(b"2".to_vec())); // 来自 WAL 重放
+}
+
+#[test]
+fn t39_bgsave_arity_error() {
+    // BGSAVE 带参数：参数校验先于持久化，纯内存服务器即可验证；错误后连接保持
+    let port = spawn_server();
+    let mut c = TestClient::connect(port);
+    c.send(&resp(&["BGSAVE", "extra"]));
+    assert_eq!(
+        c.read_reply(),
+        RespValue::Error("ERR wrong number of arguments for 'bgsave' command".into())
+    );
+    c.send(&resp(&["PING"]));
+    assert_eq!(c.read_reply(), RespValue::Simple("PONG".into()));
 }

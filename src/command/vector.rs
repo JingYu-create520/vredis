@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::{arg_bytes, key_of, wrong_arg_count, wrong_type};
+use super::{arg_bytes, key_of, persist_failed, wrong_arg_count, wrong_type};
 use crate::protocol::RespValue;
 use crate::storage::{AddVectorError, Db, IndexProbe};
 use crate::vector::{search, Metric, SearchError};
@@ -77,6 +77,7 @@ pub(crate) fn vadd(db: &Arc<Db>, args: &[RespValue]) -> RespValue {
         Ok(id) => RespValue::Bulk(id.into_bytes()),
         Err(AddVectorError::NotAnIndex) => wrong_type(),
         Err(AddVectorError::DimensionMismatch(_)) => dimension_error(),
+        Err(AddVectorError::Persist(e)) => persist_failed(e),
     }
 }
 
@@ -282,7 +283,7 @@ mod tests {
         assert_eq!(execute(&db, &arr(&["VADD", "ix", "1", "xyz"])), float_error());
         assert_eq!(execute(&db, &arr(&["VADD", "ix", "1", "inf"])), float_error());
         // 字符串 key（先预置）→ WRONGTYPE
-        db.set("s", crate::storage::Value::Str(b"x".to_vec()));
+        db.set("s", crate::storage::Value::Str(b"x".to_vec())).expect("setup: set");
         assert_eq!(execute(&db, &arr(&["VADD", "s", "1", "1.0"])), wrong_type());
     }
 
@@ -302,7 +303,7 @@ mod tests {
         );
         assert_eq!(execute(&db, &arr(&["VGET", "ix", "99"])), RespValue::Null);
         assert_eq!(execute(&db, &arr(&["VGET", "nope", "0"])), RespValue::Null);
-        db.set("s", crate::storage::Value::Str(b"x".to_vec()));
+        db.set("s", crate::storage::Value::Str(b"x".to_vec())).expect("setup: set");
         assert_eq!(execute(&db, &arr(&["VGET", "s", "0"])), wrong_type());
         assert_eq!(execute(&db, &arr(&["VGET", "ix"])), wrong_arg_count("vget"));
     }
@@ -312,7 +313,7 @@ mod tests {
         let db = db_with_index();
         assert_eq!(execute(&db, &arr(&["VDIM", "ix"])), RespValue::Integer(3));
         assert_eq!(execute(&db, &arr(&["VDIM", "nope"])), RespValue::Null);
-        db.set("s", crate::storage::Value::Str(b"x".to_vec()));
+        db.set("s", crate::storage::Value::Str(b"x".to_vec())).expect("setup: set");
         assert_eq!(execute(&db, &arr(&["VDIM", "s"])), wrong_type());
         assert_eq!(execute(&db, &arr(&["VDIM"])), wrong_arg_count("vdim"));
     }
@@ -359,7 +360,7 @@ mod tests {
             dimension_error()
         );
         // 字符串 key → WRONGTYPE
-        db.set("s", crate::storage::Value::Str(b"x".to_vec()));
+        db.set("s", crate::storage::Value::Str(b"x".to_vec())).expect("setup: set");
         assert_eq!(execute(&db, &arr(&["VSEARCH", "s", "1", "1.0"])), wrong_type());
         // k=0 / k 非整数 / 参数过少
         assert_eq!(execute(&db, &arr(&["VSEARCH", "ix", "0", "1.0", "0.0", "0.0"])), not_integer_error());

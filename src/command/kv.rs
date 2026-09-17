@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use super::{arg_bytes, key_of, wrong_arg_count, wrong_type};
+use super::{arg_bytes, key_of, persist_failed, wrong_arg_count, wrong_type};
 use crate::protocol::RespValue;
 use crate::storage::{Db, Value};
 
@@ -49,7 +49,10 @@ pub(crate) fn set(db: &Arc<Db>, args: &[RespValue]) -> RespValue {
         Some(bytes) => bytes,
         None => return wrong_arg_count("set"),
     };
-    db.set(key.to_string(), Value::Str(data.to_vec()));
+    // WAL 写失败 → 操作必须失败（design.md D11），内存未动
+    if let Err(e) = db.set(key.to_string(), Value::Str(data.to_vec())) {
+        return persist_failed(e);
+    }
     RespValue::Simple("OK".into())
 }
 
@@ -75,7 +78,10 @@ pub(crate) fn del(db: &Arc<Db>, args: &[RespValue]) -> RespValue {
         Ok(keys) => keys,
         Err(reply) => return reply,
     };
-    RespValue::Integer(db.del(&keys) as i64)
+    match db.del(&keys) {
+        Ok(count) => RespValue::Integer(count as i64),
+        Err(e) => persist_failed(e),
+    }
 }
 
 /// EXISTS key [key ...]：存在的数量；重复 key 重复计数（与 Redis 一致）。
@@ -168,8 +174,21 @@ pub(crate) fn flush_all(db: &Arc<Db>, args: &[RespValue]) -> RespValue {
     if !args.is_empty() {
         return wrong_arg_count("flushall");
     }
-    db.flush();
-    RespValue::Simple("OK".into())
+    match db.flush() {
+        Ok(()) => RespValue::Simple("OK".into()),
+        Err(e) => persist_failed(e),
+    }
+}
+
+/// BGSAVE：触发一次快照并截断 WAL（同步实现，design.md §4.1 v0.4）。
+pub(crate) fn bgsave(db: &Arc<Db>, args: &[RespValue]) -> RespValue {
+    if !args.is_empty() {
+        return wrong_arg_count("bgsave");
+    }
+    match db.bgsave() {
+        Ok(()) => RespValue::Simple("OK".into()),
+        Err(e) => persist_failed(e),
+    }
 }
 
 #[cfg(test)]
@@ -191,7 +210,7 @@ mod tests {
     fn db_with(entries: &[(&str, Value)]) -> Arc<Db> {
         let db = Arc::new(Db::new());
         for (k, v) in entries {
-            db.set(k.to_string(), v.clone());
+            db.set(k.to_string(), v.clone()).expect("setup: set");
         }
         db
     }
@@ -429,6 +448,24 @@ mod tests {
             RespValue::Simple("OK".into())
         );
         assert_eq!(execute(&db, &arr(["GET", "a"])), RespValue::Bulk(payload));
+    }
+
+    // —— BGSAVE（v0.4）——
+
+    #[test]
+    fn w10_bgsave_no_arg_is_ok() {
+        // 纯内存（Off）模式：BGSAVE 是 no-op，仍返回 +OK
+        let db = Arc::new(Db::new());
+        assert_eq!(execute(&db, &arr(["BGSAVE"])), RespValue::Simple("OK".into()));
+    }
+
+    #[test]
+    fn w11_bgsave_with_arg_is_arity_error() {
+        let db = Arc::new(Db::new());
+        assert_eq!(
+            execute(&db, &arr(["BGSAVE", "extra"])),
+            wrong_arg_count("bgsave")
+        );
     }
 
     // —— glob 匹配器直接测试（含回溯路径） ——

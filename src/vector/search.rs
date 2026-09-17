@@ -166,7 +166,7 @@ mod tests {
     fn sr04_error_states() {
         let db = db_with_3d();
         assert_eq!(search(&db, "nope", &[1.0, 0.0, 0.0], 1, Metric::Cosine), Err(SearchError::IndexMissing));
-        db.set("s", crate::storage::Value::Str(b"x".to_vec()));
+        db.set("s", crate::storage::Value::Str(b"x".to_vec())).expect("setup: set");
         assert_eq!(search(&db, "s", &[1.0, 0.0, 0.0], 1, Metric::Cosine), Err(SearchError::WrongType));
         assert_eq!(
             search(&db, "ix", &[1.0, 0.0], 1, Metric::Cosine),

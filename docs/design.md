@@ -1,7 +1,7 @@
 # vredis 设计文档（MVP）
 
-- 版本：v0.3（2026-09-18 修订：VADD 改为自动生成 id、VectorIndex 增加自增计数器、补充存储层搜索 API 与 VSEARCH 错误文案，应用阶段 5 用户决策）
-- 日期：2026-09-17（v0.1） / 2026-09-18（v0.2 / v0.3）
+- 版本：v0.4（2026-09-18 新增：WAL + 快照持久化与启动恢复、BGSAVE 命令，应用进阶 1 用户确认决策 D9–D12）
+- 日期：2026-09-17（v0.1） / 2026-09-18（v0.2 / v0.3 / v0.4）
 - 上游约束：本设计严格遵守 [vredis-charter.md](./vredis-charter.md)（最高规则）
 
 ---
@@ -29,7 +29,7 @@
   ▼                            ▼
 ④ 存储层（src/storage）         ⑤ 向量索引层（src/vector）
   Db：key → Value 内存哈希表     距离度量：cos / l2 / dot
-  Mutex<HashMap> 单把大锁        索引内暴力扫描 top-k（MVP 无 HNSW）
+  Mutex<DbInner> 单把大锁+WAL   索引内暴力扫描 top-k（MVP 无 HNSW）
 ```
 
 | 层 | 模块 | 职责 | 使用的基础设施 |
@@ -80,6 +80,10 @@ vredis/
 │       ├── mod.rs          # 向量索引层模块根
 │       ├── distance.rs     # Metric 枚举与 cos / l2 / dot 距离实现
 │       └── search.rs       # 暴力搜索：索引内全量扫描 + 大小为 k 的二叉堆
+│   └── persist/            # 持久化层（v0.4，与 storage 同属引擎层，crate 内互引见 D7）
+│       ├── mod.rs          # PersistConfig / PersistError / 共享编解码原语 / Value 编解码
+│       ├── wal.rs          # WAL 记录格式、追加写入器、重放（撕裂尾 vs 真损坏）
+│       └── snapshot.rs     # 快照原子写入（tmp+fsync+rename）与加载校验
 └── tests/
     └── e2e.rs              # M6 阶段：真实 TCP 端到端集成测试（使用临时端口，不占 6379）
 ```
@@ -145,6 +149,14 @@ pub fn search(db: &Db, index: &str, query: &[f32], k: usize, metric: Metric) -> 
 // ── command/mod.rs：分发层统一入口 ──────────────────────────────────
 pub fn execute(db: &Arc<Db>, req: &[RespValue]) -> RespValue;
 // req[0] 是命令名（Bulk），后续为参数；用 match 做静态命令表，MVP 不搞注册机制
+
+// ── persist/：WAL + 快照（v0.4，详见 §3.1） ─────────────────────────
+pub struct PersistConfig { dir: PathBuf }   // 默认 = exe 所在目录/data，自动创建
+pub enum PersistError { Io(String), Corrupt(String) }
+// wal.rs:      WalEntry { Set{key,value}, Del{keys}, FlushAll, VAdd{key,data} }
+//              WalWriter::append（记录 = magic|len|FNV-1a|payload，写后 flush）
+//              replay(path) -> {entries, valid_len}（撕裂尾→截断；校验错→Err）
+// snapshot.rs: save(map, path)（tmp → fsync → 原子 rename）/ load(path)（尾校验，损坏→Err）
 ```
 
 ### 关键设计决策
@@ -159,6 +171,19 @@ pub fn execute(db: &Arc<Db>, req: &[RespValue]) -> RespValue;
 | D6 | 静态 `match` 命令表 | 最小实现；命令总数 < 15，不需要注册/反射机制 |
 | D7 | key 即向量索引名：一个索引锁定一个维度，内含多条带 id 的向量 | 2026-09-18 用户审核修订：搜索范围限定在索引内，并消除跨维度跳过的歧义 |
 | D8 | VADD 自动生成 id：索引内自增十进制串（从 "0" 起），Bulk 返回 | 2026-09-18 阶段 5 用户决策，取代 v0.2 的显式 id 语法；id 永不碰撞，覆盖语义随之取消 |
+| D9 | WAL 先行：写路径（set/del/flush/vector_add）在同一把引擎锁临界区内「先写 WAL 再改内存」 | 多线程下 WAL 顺序 == 内存顺序，崩溃重放必然收敛到崩溃前最后状态 |
+| D10 | WAL 尾部字节不足（进程崩溃在写入中途）→ 撕裂尾：截断+stderr 警告后继续；完整记录 magic/校验和错 → 真损坏：报错退出 | 撕裂记录从未被 ack 给任何客户端，丢弃安全；真损坏必须拒绝静默丢数据 |
+| D11 | WAL 写失败 → 该操作立即失败（内存未动）且引擎置 `Broken`（只读），直到 BGSAVE 成功自愈 | 不允许"内存改了但日志没写" |
+| D12 | 每条 WAL 记录 flush 不 fsync；快照写入 fsync | 进程崩溃不丢（数据在 OS 页缓存）；断电最多丢 WAL 尾部（MVP 取舍，fsync 每条代价过大） |
+
+### 3.1 持久化（v0.4）
+
+- 数据目录：`<可执行文件所在目录>/data/`，含 `wal.log` 与 `snapshot.vrdb`；不存在自动创建。测试注入临时目录（`PersistConfig`）。
+- WAL 格式：`记录 = magic "VRLE"(4B) | payload_len(4B) | FNV-1a 校验和(4B) | payload`。payload = 操作码(1B) + 内容；`SET` 记录**完整 Value**（复用快照的 Value 编码——SET 可覆盖向量索引，重放必须还原整值）；`DEL` 记录整批 key；`VADD` 记录 key + f32 分量。
+- 快照格式：`"VRDB" | version(4B) | 条目数(4B) | 条目×N（key + Value 编码）| 全体 FNV-1a 尾校验`；写入 `snapshot.tmp` → fsync → 原子 rename 到 `snapshot.vrdb`。
+- 恢复流程：加载快照（若有）→ 逐条重放 WAL（重放期间 WAL 状态 Off，重放不写日志）→ 撕裂尾截断（若有）→ 打开追加 writer。**恢复后 WAL 原样保留**（只截撕裂尾）——清空会在下次崩溃且无新快照时丢数据；仅 BGSAVE 成功后截断 WAL。
+- BGSAVE：同步实现（无后台线程）；引擎锁内序列化整库 → 原子替换快照 → 截断重开 WAL；`Broken` 状态借此自愈。
+- Range 前缀：WAL/快照校验和统一 FNV-1a 32 位（std 手写 ~10 行，零依赖）。
 
 ---
 
@@ -179,6 +204,7 @@ pub fn execute(db: &Arc<Db>, req: &[RespValue]) -> RespValue;
 | KEYS | `KEYS pattern` | bulk 数组 | MVP 通配符仅支持 `*`（任意序列）与 `?`（单字符），不含 `[...]` |
 | TYPE | `TYPE key` | `+string` / `+vector` / `+none` | `vector` 为本库扩展类型（向量索引） |
 | FLUSHALL | `FLUSHALL` | `+OK` | 清空全部数据 |
+| BGSAVE | `BGSAVE` | `+OK` | 触发一次快照并截断 WAL（v0.4；同步实现，无后台线程）；有参数 → wrong args |
 
 请求/响应示例（RESP2 报文）：
 
@@ -229,6 +255,7 @@ VSEARCH 语义细则（必须在文档与注释中写明）：
 | 维度不匹配 | `-ERR invalid vector dimension` |
 | 整数解析失败/越界 | `-ERR value is not an integer or out of range`（VADD 的 dim、VSEARCH 的 k 等） |
 | 度量名非法 | `-ERR invalid metric`（VSEARCH 的 METRIC 参数） |
+| 持久化失败 | `-ERR persist failed: <reason>`（WAL 写失败 / BGSAVE 失败，v0.4；失败后引擎只读，BGSAVE 自愈） |
 | key 非 UTF-8 | `-ERR key must be valid UTF-8` |
 | 协议损坏 | `-ERR Protocol error ...` 后**断开连接**（与 Redis 一致） |
 
@@ -295,4 +322,8 @@ VSEARCH 语义细则（必须在文档与注释中写明）：
 
 对应章程边界 + MVP 简化项，均列入未来清单、当前一律不实现：
 
-TTL/过期删除、持久化（RDB/AOF）、事务（MULTI/EXEC）、发布订阅、Lua 脚本、SELECT 多数据库、AUTH 认证、HNSW/IVF 索引、集群、连接空闲超时管理、`SET` 的 EX/NX 等选项、完整 glob 通配符、删除索引内单条向量（VDEL）。
+TTL/过期删除、完整 RDB/AOF 兼容（本库使用自研 WAL + 快照，v0.4 已实现）、事务（MULTI/EXEC）、发布订阅、Lua 脚本、SELECT 多数据库、AUTH 认证、HNSW/IVF 索引、集群、连接空闲超时管理、`SET` 的 EX/NX 等选项、完整 glob 通配符、删除索引内单条向量（VDEL）。
+
+### 已知限制 v0.4
+
+BGSAVE 若快照保存成功但 WAL 截断失败，重启后 VADD 会重复插入（SET/DEL/FLUSHALL 幂等无影响）。不修原因：任何修复方案在另一失败模式下会导致数据丢失。修复需引入 WAL epoch，列入未来方向。

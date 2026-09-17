@@ -19,4 +19,5 @@
 ## 已知限制
 
 - redis-cli 端到端实测待有环境时补做（当前由 36 个真实 TCP 用例保证 RESP2 兼容性）。
-- 其他 MVP 范围外的简化项见 [design.md §8](./design.md)（TTL、持久化、事务、发布订阅、HNSW 等）。
+- BGSAVE 若快照保存成功但 WAL 截断失败，重启后 VADD 会重复插入（SET/DEL/FLUSHALL 幂等无影响）。不修原因：任何修复方案在另一失败模式下会导致数据丢失；修复需引入 WAL epoch，列入未来方向（design.md §8「已知限制 v0.4」）。
+- 其他 MVP 范围外的简化项见 [design.md §8](./design.md)（TTL、事务、发布订阅、HNSW 等）。

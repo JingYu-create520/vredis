@@ -8,6 +8,7 @@ mod vector;
 
 use std::sync::Arc;
 
+use crate::persist::PersistError;
 use crate::protocol::RespValue;
 use crate::storage::Db;
 
@@ -30,6 +31,7 @@ pub fn execute(db: &Arc<Db>, req: &[RespValue]) -> RespValue {
         "KEYS" => kv::keys(db, &req[1..]),
         "TYPE" => kv::type_of(db, &req[1..]),
         "FLUSHALL" => kv::flush_all(db, &req[1..]),
+        "BGSAVE" => kv::bgsave(db, &req[1..]),
         "VADD" => vector::vadd(db, &req[1..]),
         "VGET" => vector::vget(db, &req[1..]),
         "VDIM" => vector::vdim(db, &req[1..]),
@@ -73,6 +75,11 @@ pub(crate) fn wrong_type() -> RespValue {
     RespValue::Error(
         "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
     )
+}
+
+/// `-ERR persist failed: <reason>`（design.md §4.3 v0.4：WAL/快照失败时操作必须失败）。
+pub(crate) fn persist_failed(e: PersistError) -> RespValue {
+    RespValue::Error(format!("ERR persist failed: {e}"))
 }
 
 #[cfg(test)]
