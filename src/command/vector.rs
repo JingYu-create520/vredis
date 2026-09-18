@@ -5,7 +5,12 @@ use std::sync::Arc;
 use super::{arg_bytes, key_of, persist_failed, wrong_arg_count, wrong_type};
 use crate::protocol::RespValue;
 use crate::storage::{AddVectorError, Db, IndexProbe};
+use crate::vector::search::Hit;
 use crate::vector::{search, Metric, SearchError};
+
+/// HNSW 路径的搜索宽度（MVP 固定值，h11/h12 已验证该配置召回 1.0；
+/// 未来可作为 VSEARCH 的 EF 参数暴露）。
+const HNSW_DEFAULT_SEARCH_EF: usize = 100;
 
 /// `-ERR value is not an integer or out of range`（Redis 文案，design.md §4.3）。
 fn not_integer_error() -> RespValue {
@@ -47,9 +52,12 @@ fn parse_f32(value: &RespValue) -> Option<f32> {
         .filter(|v| v.is_finite())
 }
 
-/// VADD key dim v1 ... vdim → 自动生成的向量 id（索引内自增十进制串，Bulk 返回）。
+/// VADD key dim v1 ... vdim [METRIC cos|l2|dot] → 自动生成的向量 id（Bulk）。
 ///
-/// 索引不存在时由 storage 层创建并锁定维度；dim 与索引锁定维度不符 → 报错。
+/// 索引不存在时由 storage 层创建并锁定维度与 metric（缺省 cos）；
+/// `dim` 与索引锁定维度不符 → 报错。
+/// ★ 参数解析顺序与 VSEARCH 相同（防 dim=1 计数歧义）：
+/// 1) 先剥离可选 METRIC 尾缀；2) 再校验分量数 == dim；3) 最后逐分量解析浮点。
 pub(crate) fn vadd(db: &Arc<Db>, args: &[RespValue]) -> RespValue {
     let [key_arg, dim_arg, rest @ ..] = args else {
         return wrong_arg_count("vadd");
@@ -58,26 +66,39 @@ pub(crate) fn vadd(db: &Arc<Db>, args: &[RespValue]) -> RespValue {
         Ok(k) => k,
         Err(reply) => return reply,
     };
+    // 1) 先剥离可选 METRIC 尾缀（末两个参数 = METRIC 关键字 + 度量名，缺省 cos）
+    let n = rest.len();
+    let (components, metric) = if n >= 2 && is_metric_keyword(&rest[n - 2]) {
+        let metric = match arg_bytes(&rest[n - 1]).and_then(Metric::parse) {
+            Some(m) => m,
+            None => return metric_error(),
+        };
+        (&rest[..n - 2], metric)
+    } else {
+        (rest, Metric::Cosine)
+    };
     let dim = match parse_usize_nonzero(dim_arg) {
         Ok(d) => d,
         Err(reply) => return reply,
     };
-    // 声明维度必须与分量个数一致（design.md §4.2）
-    if rest.len() != dim {
+    // 2) 再校验分量个数 == 声明维度（design.md §4.2）
+    if components.len() != dim {
         return dimension_error();
     }
+    // 3) 最后逐分量解析浮点
     let mut data = Vec::with_capacity(dim);
-    for arg in rest {
+    for arg in components {
         match parse_f32(arg) {
             Some(v) => data.push(v),
             None => return float_error(),
         }
     }
-    match db.vector_add(key, data) {
+    match db.vector_add_with_metric(key, data, metric) {
         Ok(id) => RespValue::Bulk(id.into_bytes()),
         Err(AddVectorError::NotAnIndex) => wrong_type(),
         Err(AddVectorError::DimensionMismatch(_)) => dimension_error(),
         Err(AddVectorError::Persist(e)) => persist_failed(e),
+        Err(AddVectorError::Internal(e)) => RespValue::Error(format!("ERR internal error: {e}")),
     }
 }
 
@@ -115,7 +136,7 @@ pub(crate) fn vdim(db: &Arc<Db>, args: &[RespValue]) -> RespValue {
         Err(reply) => return reply,
     };
     match db.probe_index(key) {
-        IndexProbe::Dim(dim) => RespValue::Integer(dim as i64),
+        IndexProbe::Index { dim, .. } => RespValue::Integer(dim as i64),
         IndexProbe::Missing => RespValue::Null,
         IndexProbe::NotAnIndex => wrong_type(),
     }
@@ -153,8 +174,9 @@ pub(crate) fn vsearch(db: &Arc<Db>, args: &[RespValue]) -> RespValue {
         (rest, Metric::Cosine) // 默认 cos（design.md §4.2）
     };
     // ── 2) 校验分量个数 == 索引维度（经 storage probe，短临界区）──
-    let expected_dim = match db.probe_index(key) {
-        IndexProbe::Dim(dim) => dim,
+    // 同时取出索引锁定的 metric：与查询 metric 比对后决定 HNSW / 暴力分发
+    let (expected_dim, index_metric) = match db.probe_index(key) {
+        IndexProbe::Index { dim, metric } => (dim, metric),
         IndexProbe::Missing => return RespValue::Null,
         IndexProbe::NotAnIndex => return wrong_type(),
     };
@@ -169,21 +191,45 @@ pub(crate) fn vsearch(db: &Arc<Db>, args: &[RespValue]) -> RespValue {
             None => return float_error(),
         }
     }
-    // 搜索：遍历 + top-k 收集全部在 storage 持锁回调内完成，不克隆索引
-    match search(db, key, &query, k, metric) {
-        Ok(hits) => RespValue::Array(
-            hits.into_iter()
-                .flat_map(|h| {
-                    [
-                        RespValue::Bulk(h.id.into_bytes()),
-                        RespValue::Bulk(h.dist.to_string().into_bytes()),
-                    ]
-                })
-                .collect(),
-        ),
-        Err(SearchError::IndexMissing) => RespValue::Null, // probe 与遍历之间被删除的竞态
-        Err(SearchError::WrongType) => wrong_type(),
-        Err(SearchError::DimensionMismatch(_)) => dimension_error(),
+    // ── 4) 分发（进阶 3 第 4 步）──
+    // metric 匹配且 HNSW 启用 → HNSW 路径（hnsw_search 内部判开关）；
+    // metric 不匹配 → 直接暴力（绝不用错 metric 的图，补充 3 语义）；
+    // HNSW 不可用（None，未启用/竞态删除）→ 暴力 fallback（正确性优先）。
+    let compute_brute = || search(db, key, &query, k, metric);
+    let hits: Vec<Hit> = if metric == index_metric {
+        match db.hnsw_search(key, &query, k, HNSW_DEFAULT_SEARCH_EF) {
+            Some(Ok(hits)) => hits,
+            // HNSW 维度错误与暴力路径同语义（probe 已校验，此处为竞态兜底）
+            Some(Err(_)) => return dimension_error(),
+            None => match compute_brute() {
+                Ok(hits) => hits,
+                Err(e) => return search_error_reply(e),
+            },
+        }
+    } else {
+        match compute_brute() {
+            Ok(hits) => hits,
+            Err(e) => return search_error_reply(e),
+        }
+    };
+    RespValue::Array(
+        hits.into_iter()
+            .flat_map(|h| {
+                [
+                    RespValue::Bulk(h.id.into_bytes()),
+                    RespValue::Bulk(h.dist.to_string().into_bytes()),
+                ]
+            })
+            .collect(),
+    )
+}
+
+/// 把暴力搜索的 typed 错误映射为 RESP2 回复（vsearch 分发复用）。
+fn search_error_reply(e: SearchError) -> RespValue {
+    match e {
+        SearchError::IndexMissing => RespValue::Null, // probe 与遍历之间被删除的竞态
+        SearchError::WrongType => wrong_type(),
+        SearchError::DimensionMismatch(_) => dimension_error(),
     }
 }
 
@@ -196,6 +242,8 @@ fn is_metric_keyword(value: &RespValue) -> bool {
 mod tests {
     use super::*;
     use crate::command::execute;
+    use crate::storage::Value;
+    use crate::vector::Metric;
 
     /// 构造并预置一个 3 维索引（含 2 条向量）的 Db（测试辅助）。
     fn db_with_index() -> Arc<Db> {
@@ -382,6 +430,44 @@ mod tests {
         assert_eq!(
             execute(&db, &arr(&["VSEARCH", "one", "1", "METRIC", "cos"])),
             dimension_error()
+        );
+    }
+
+    // —— VADD METRIC 尾缀（进阶 3，w12–w14）——
+
+    #[test]
+    fn w12_vadd_default_metric_is_cosine() {
+        // VADD 不带 METRIC → 索引 metric 缺省 Cosine
+        let db = Arc::new(Db::new());
+        assert_eq!(
+            execute(&db, &arr(&["VADD", "ix", "1", "1.0"])),
+            RespValue::Bulk(b"0".to_vec())
+        );
+        match db.get("ix") {
+            Some(Value::VectorIndex { metric, .. }) => assert_eq!(metric, Metric::Cosine),
+            other => panic!("expected vector index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn w13_vadd_metric_trailer() {
+        let db = Arc::new(Db::new());
+        assert_eq!(
+            execute(&db, &arr(&["VADD", "ix", "1", "1.0", "METRIC", "l2"])),
+            RespValue::Bulk(b"0".to_vec())
+        );
+        match db.get("ix") {
+            Some(Value::VectorIndex { metric, .. }) => assert_eq!(metric, Metric::L2),
+            other => panic!("expected vector index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn w14_vadd_bad_metric_name() {
+        let db = Arc::new(Db::new());
+        assert_eq!(
+            execute(&db, &arr(&["VADD", "ix", "1", "1.0", "METRIC", "euclid"])),
+            metric_error()
         );
     }
 }

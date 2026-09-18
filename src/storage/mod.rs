@@ -17,12 +17,16 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::persist::wal::{self, WalEntry, WalWriter};
-use crate::persist::{snapshot, PersistConfig, PersistError};
+use crate::persist::{fnv1a, snapshot, PersistConfig, PersistError};
+use crate::vector::hnsw::HnswIndex;
+use crate::vector::search::Hit;
+use crate::vector::Metric;
 
 pub use value::Value;
 
 /// VADD 的错误（命令层映射：NotAnIndex → WRONGTYPE；DimensionMismatch → invalid
-/// vector dimension；Persist → `-ERR persist failed: <reason>`）。
+/// vector dimension；Persist → `-ERR persist failed: <reason>`；
+/// Internal → `-ERR internal error`（不变量违例，如实上抛）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddVectorError {
     /// key 存的是字符串（非向量索引）
@@ -31,6 +35,8 @@ pub enum AddVectorError {
     DimensionMismatch(usize),
     /// WAL 写失败（design.md D11：内存未动，引擎转入 Broken）
     Persist(PersistError),
+    /// HNSW 索引内部不变量违例（不应发生；章程禁 panic，如实上抛）
+    Internal(String),
 }
 
 /// VGET 的错误（key 是字符串，非索引）。
@@ -42,8 +48,8 @@ pub enum GetVectorError {
 /// 索引探测结果（VDIM / VSEARCH 前置校验用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexProbe {
-    /// 索引存在，维度为创建时锁定值
-    Dim(usize),
+    /// 索引存在：维度（创建时锁定）与 metric（HNSW 建图锁定，VSEARCH 分发用）
+    Index { dim: usize, metric: Metric },
     /// key 不存在
     Missing,
     /// key 存在但不是向量索引
@@ -61,6 +67,18 @@ pub enum VisitOutcome {
     NotAnIndex,
 }
 
+// ── HNSW 建图常量（进阶 3；召回率已由 h11/h12 验证为 1.0）──
+/// 每层最大邻居数 m（论文默认值）
+const HNSW_M: usize = 16;
+/// 建图搜索宽度 ef_construction
+const HNSW_EF_CONSTRUCTION: usize = 200;
+
+/// HNSW 建图 seed：`seed = u64::from(fnv1a(key.as_bytes()))`——
+/// 同 key 重建时 seed 确定性一致（重启重建后图与崩溃前逐项一致）。
+fn hnsw_seed(key: &str) -> u64 {
+    u64::from(fnv1a(key.as_bytes()))
+}
+
 /// WAL 状态机（design.md D11）。
 #[derive(Debug, Default)]
 enum WalState {
@@ -73,13 +91,19 @@ enum WalState {
     Broken,
 }
 
-/// 引擎状态：内存表 + WAL + 数据目录，整体在一把锁内。
+/// 引擎状态：内存表 + WAL + 数据目录 + HNSW 索引，整体在一把锁内。
 #[derive(Debug, Default)]
 struct DbInner {
     map: HashMap<String, Value>,
     wal: WalState,
     /// 数据目录；None = 纯内存模式（bgsave 为 no-op）
     dir: Option<PathBuf>,
+    /// HNSW 索引（纯内存，重启重建）：key → 索引，与 map 中的 VectorIndex 一一对应
+    ///（仅在 hnsw_enabled 时维护）
+    hnsw: HashMap<String, HnswIndex>,
+    /// HNSW 启用开关（进阶 3 第 4 步）：false = 纯暴力搜索（默认），
+    /// 由 main 的环境变量 `VREDIS_HNSW` 或测试注入决定
+    hnsw_enabled: bool,
 }
 
 impl DbInner {
@@ -121,14 +145,25 @@ impl Db {
     // ── 启动恢复（design.md §3.1 v0.4）──
 
     /// 打开（含恢复）：加载快照 → 重放 WAL → 截断撕裂尾 → attach 追加 writer。
+    /// 默认**不启用** HNSW（纯暴力搜索，进阶 3 第 4 步）；启用见 [`Db::open_with`]。
+    pub fn open(cfg: &PersistConfig) -> Result<(Db, Vec<String>), PersistError> {
+        Self::open_with(cfg, false)
+    }
+
+    /// 打开（含恢复）并可选启用 HNSW 索引（进阶 3 第 4 步）。
     ///
     /// - 快照或 WAL **真损坏** → `Err`（main 打印并以非零码退出，不静默丢数据）；
     /// - **撕裂尾**（进程崩溃在写入中途）→ 截断到最后一条完整记录，
     ///   警告文本放入返回的 `Vec<String>`（由 main 打印到 stderr）；
     /// - 重放期间 WAL 状态为 `Off`（重放绝不写日志），完成后才 attach `Active`；
     /// - **已重放的 WAL 原样保留**（只截撕裂尾）——清空会在“无新快照又崩溃”时丢数据；
-    ///   仅 BGSAVE 成功后截断（design.md D4）。
-    pub fn open(cfg: &PersistConfig) -> Result<(Db, Vec<String>), PersistError> {
+    ///   仅 BGSAVE 成功后截断（design.md D4）；
+    /// - `hnsw_enabled = true` 时：恢复完成后按 id 数值序重建全部 HNSW，
+    ///   且后续写路径同步维护索引；`false` 时完全不建图（纯暴力搜索）。
+    pub fn open_with(
+        cfg: &PersistConfig,
+        hnsw_enabled: bool,
+    ) -> Result<(Db, Vec<String>), PersistError> {
         std::fs::create_dir_all(&cfg.dir)
             .map_err(|e| PersistError::Io(format!("创建数据目录失败: {e}")))?;
         let mut map = HashMap::new();
@@ -162,7 +197,32 @@ impl Db {
                 ));
             }
         }
-        // 4) attach 追加 writer（不截断：已重放内容必须保留）
+        // 4) HNSW 重建（纯内存结构不持久化；仅启用时）：遍历恢复出的全部向量索引，
+        //    按 id 数值序（== 原插入序）逐条重插；seed = fnv1a(key) 确定性，
+        //    重建后图与崩溃前逐项一致。失败 → Corrupt（响亮退出）
+        let mut hnsw = HashMap::new();
+        if hnsw_enabled {
+            for (key, value) in &map {
+                if let Value::VectorIndex { vectors, metric, .. } = value {
+                    let mut ix =
+                        HnswIndex::new(*metric, HNSW_M, HNSW_EF_CONSTRUCTION, hnsw_seed(key))
+                            .map_err(|e| {
+                                PersistError::Corrupt(format!("HNSW 重建失败（{key}）: {e}"))
+                            })?;
+                    let mut ids: Vec<&String> = vectors.keys().collect();
+                    ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
+                    for id in &ids {
+                        ix.insert(id, &vectors[*id]).map_err(|e| {
+                            PersistError::Corrupt(format!(
+                                "HNSW 重建失败（{key}/{id}）: {e}"
+                            ))
+                        })?;
+                    }
+                    hnsw.insert(key.clone(), ix);
+                }
+            }
+        }
+        // 5) attach 追加 writer（不截断：已重放内容必须保留）
         let writer = WalWriter::open(&wal_path)?;
         Ok((
             Db {
@@ -170,6 +230,8 @@ impl Db {
                     map,
                     wal: WalState::Active(writer),
                     dir: Some(cfg.dir.clone()),
+                    hnsw,
+                    hnsw_enabled,
                 }),
             },
             warnings,
@@ -181,7 +243,8 @@ impl Db {
     ///
     /// - `Off`（纯内存，无数据目录）→ no-op `Ok`；
     /// - `Broken` → 借此自愈（内存数据仍完整，直接落快照重建 WAL）；
-    /// - 同步实现，无后台线程（MVP 约束）。
+    /// - 同步实现，无后台线程（MVP 约束）；
+    /// - **不动 HNSW**（纯内存结构，不持久化；重启时从恢复的数据重建）。
     pub fn bgsave(&self) -> Result<(), PersistError> {
         let mut inner = self.lock_inner();
         let Some(dir) = inner.dir.clone() else {
@@ -203,6 +266,8 @@ impl Db {
         let key = key.into();
         let mut inner = self.lock_inner();
         inner.write_through(|| WalEntry::Set { key: key.clone(), value: value.clone() })?;
+        // SET 覆盖任意类型：同 key 的 HNSW 索引（若有）随之作废（同一临界区内）
+        inner.hnsw.remove(&key);
         inner.map.insert(key, value);
         Ok(())
     }
@@ -218,7 +283,15 @@ impl Db {
     pub fn del(&self, keys: &[String]) -> Result<usize, PersistError> {
         let mut inner = self.lock_inner();
         inner.write_through(|| WalEntry::Del { keys: keys.to_vec() })?;
-        Ok(keys.iter().filter(|k| inner.map.remove(k.as_str()).is_some()).count())
+        let mut removed = 0;
+        for key in keys {
+            if inner.map.remove(key.as_str()).is_some() {
+                // 命中的若是向量索引，其 HNSW 同步作废（同一临界区内）
+                inner.hnsw.remove(key.as_str());
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// 统计存在的 key 数量；重复 key 重复计数（与 Redis EXISTS 一致）。只读操作。
@@ -239,41 +312,77 @@ impl Db {
         let mut inner = self.lock_inner();
         inner.write_through(|| WalEntry::FlushAll)?;
         inner.map.clear();
+        inner.hnsw.clear();
         Ok(())
     }
 
     // ── 向量 API（v0.3）：遍历/探测单次持锁，禁止把索引克隆出锁外 ──
 
-    /// 向索引添加向量并返回自动生成的 id（索引内自增十进制串，从 "0" 起）。
-    /// 索引不存在则创建并锁定维度（dim = data.len()）。
-    ///
-    /// ★ 同一临界区内：先写 WAL（VADD 记录 key + 分量）再改内存；
-    ///   WAL 失败 → [`AddVectorError::Persist`] 且内存未动（design.md D11）。
-    ///   原子性：维度检查 + id 生成 + 插入 + 计数器递增一次完成，并发 VADD
-    ///   不会产生重复 id 或漏计数。
+    /// 向索引添加向量（缺省 metric = Cosine）。见 [`Db::vector_add_with_metric`]。
     pub fn vector_add(&self, key: &str, data: Vec<f32>) -> Result<String, AddVectorError> {
+        self.vector_add_with_metric(key, data, Metric::Cosine)
+    }
+
+    /// 指定度量并向索引添加向量，返回自动生成的 id（索引内自增十进制串，从 "0" 起）。
+    /// 索引不存在则创建并锁定维度与 metric（dim = data.len()）。
+    ///
+    /// ★ 同一临界区内：先写 WAL（VADD 记录 key + 分量 + metric）再改内存
+    /// （map 与 HNSW 同步更新）；WAL 失败 → [`AddVectorError::Persist`] 且内存未动
+    /// （design.md D11）。原子性：维度/metric 检查 + id 生成 + 插入 + 计数器递增
+    /// 一次完成，并发 VADD 不会产生重复 id 或漏计数。
+    pub fn vector_add_with_metric(
+        &self,
+        key: &str,
+        data: Vec<f32>,
+        metric: Metric,
+    ) -> Result<String, AddVectorError> {
         let dim = data.len();
         let mut inner = self.lock_inner();
         inner
-            .write_through(|| WalEntry::VAdd { key: key.to_string(), data: data.clone() })
+            .write_through(|| WalEntry::VAdd {
+                key: key.to_string(),
+                data: data.clone(),
+                metric,
+            })
             .map_err(AddVectorError::Persist)?;
         match inner.map.get_mut(key) {
             None => {
                 let id = "0".to_string();
                 let vectors = HashMap::from([(id.clone(), data)]);
+                // HNSW 维护仅在启用时进行（未启用 → 纯内存 + 暴力搜索，进阶 3 第 4 步）
+                if inner.hnsw_enabled {
+                    let mut ix =
+                        HnswIndex::new(metric, HNSW_M, HNSW_EF_CONSTRUCTION, hnsw_seed(key))
+                            .map_err(|e| {
+                                AddVectorError::Internal(format!("HNSW 建图失败: {e}"))
+                            })?;
+                    ix.insert(&id, &vectors[&id])
+                        .map_err(|e| AddVectorError::Internal(format!("HNSW 插入失败: {e}")))?;
+                    inner.hnsw.insert(key.to_string(), ix);
+                }
                 inner.map.insert(
                     key.to_string(),
-                    Value::VectorIndex { dim, vectors, next_id: 1 },
+                    Value::VectorIndex { dim, metric, vectors, next_id: 1 },
                 );
                 Ok(id)
             }
-            Some(Value::VectorIndex { dim: locked, vectors, next_id }) => {
+            Some(Value::VectorIndex { dim: locked, vectors, next_id, metric: _ }) => {
                 if dim != *locked {
                     return Err(AddVectorError::DimensionMismatch(*locked));
                 }
                 let id = next_id.to_string();
                 *next_id += 1;
-                vectors.insert(id.clone(), data);
+                vectors.insert(id.clone(), data.clone());
+                // HNSW 维护仅在启用时进行；不变量（启用时 map ⟺ hnsw）违例如实上抛
+                if inner.hnsw_enabled {
+                    let Some(ix) = inner.hnsw.get_mut(key) else {
+                        return Err(AddVectorError::Internal(
+                            "HNSW 索引与存储状态不一致（不变量违例）".to_string(),
+                        ));
+                    };
+                    ix.insert(&id, &data)
+                        .map_err(|e| AddVectorError::Internal(format!("HNSW 插入失败: {e}")))?;
+                }
                 Ok(id)
             }
             Some(Value::Str(_)) => Err(AddVectorError::NotAnIndex),
@@ -290,11 +399,15 @@ impl Db {
         }
     }
 
-    /// 探测索引维度。维度创建即永久锁定，probe 与后续遍历之间不存在维度漂移。
+    /// 探测索引维度与 metric。两者均在创建时永久锁定，
+    /// probe 与后续操作之间不存在维度/度量漂移。
     pub fn probe_index(&self, key: &str) -> IndexProbe {
         let inner = self.lock_inner();
         match inner.map.get(key) {
-            Some(Value::VectorIndex { dim, .. }) => IndexProbe::Dim(*dim),
+            Some(Value::VectorIndex { dim, metric, .. }) => IndexProbe::Index {
+                dim: *dim,
+                metric: *metric,
+            },
             Some(Value::Str(_)) => IndexProbe::NotAnIndex,
             None => IndexProbe::Missing,
         }
@@ -325,6 +438,35 @@ impl Db {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// HNSW 搜索（进阶 3 第 4 步 VSEARCH 集成预留；本步未接入命令层）。
+    ///
+    /// ★ metric 匹配语义（第 4 步调用方遵守）：
+    /// hnsw_search 只按**索引自己的 metric** 工作（建图时锁定）。
+    /// 调用方必须先比对：VSEARCH 的 metric == VectorIndex 的 metric → 走 HNSW；
+    /// 不等 → 走暴力搜索（保证正确性，绝不用错 metric 的图）。
+    /// 本方法不接收 metric 参数——索引建图时已锁定。
+    ///
+    /// 返回：`None` = 该 key 无 HNSW 可用（key 不存在或不是向量索引）→ 调用方
+    /// fallback；`Some(Ok(hits))` = HNSW 结果（升序）；`Some(Err)` = 维度不符等
+    /// HNSW 内部错误。
+    pub fn hnsw_search(
+        &self,
+        key: &str,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Option<Result<Vec<Hit>, String>> {
+        let inner = self.lock_inner();
+        // 未启用 HNSW：恒为 None，调用方 fallback 暴力（进阶 3 第 4 步）
+        if !inner.hnsw_enabled {
+            return None;
+        }
+        inner.hnsw.get(key).map(|ix| {
+            ix.search(query, k, ef)
+                .map(|hits| hits.into_iter().map(|(id, dist)| Hit { id, dist }).collect())
+        })
+    }
+
     /// 仅测试用：把 WAL 置为 Broken（模拟写入失败后的只读状态机）。
     #[cfg(test)]
     fn break_wal(&self) {
@@ -352,15 +494,20 @@ fn apply_recovered(
         WalEntry::FlushAll => {
             map.clear();
         }
-        WalEntry::VAdd { key, data } => {
+        WalEntry::VAdd { key, data, metric } => {
             let dim = data.len();
             match map.get_mut(&key) {
                 None => {
                     let id = "0".to_string();
                     let vectors = HashMap::from([(id, data)]);
-                    map.insert(key, Value::VectorIndex { dim, vectors, next_id: 1 });
+                    map.insert(key, Value::VectorIndex { dim, metric, vectors, next_id: 1 });
                 }
-                Some(Value::VectorIndex { dim: locked, vectors, next_id }) => {
+                Some(Value::VectorIndex { dim: locked, vectors, next_id, metric: locked_metric }) => {
+                    if *locked_metric != metric {
+                        return Err(PersistError::Corrupt(
+                            "WAL 中 VADD 的 metric 与索引 metric 不符".to_string(),
+                        ));
+                    }
                     if dim != *locked {
                         return Err(PersistError::Corrupt(format!(
                             "WAL 中 VADD 维度 {dim} 与索引维度 {locked} 不符"
@@ -389,10 +536,16 @@ mod tests {
 
     use super::*;
     use crate::persist::PersistConfig;
+    use crate::vector::distance::distance;
 
-    /// 构造一个 VectorIndex 值（测试预置用）。
+    /// 构造一个 VectorIndex 值（测试预置用；metric 取缺省 Cosine）。
     fn vec_index(dim: usize) -> Value {
-        Value::VectorIndex { dim, vectors: HashMap::new(), next_id: 0 }
+        Value::VectorIndex {
+            dim,
+            metric: Metric::Cosine,
+            vectors: HashMap::new(),
+            next_id: 0,
+        }
     }
 
     /// 唯一临时数据目录（测试辅助；幂等清理）。
@@ -508,6 +661,7 @@ mod tests {
     fn s10_vector_index_shape() {
         let v = Value::VectorIndex {
             dim: 3,
+            metric: Metric::L2,
             vectors: [("alice".to_string(), vec![1.0, 0.0, 0.0])].into_iter().collect(),
             next_id: 0,
         };
@@ -527,7 +681,10 @@ mod tests {
         let db = Db::new();
         assert_eq!(db.vector_add("ix", vec![1.0, 0.0, 0.0]), Ok("0".to_string()));
         assert_eq!(db.vector_add("ix", vec![0.0, 1.0, 0.0]), Ok("1".to_string()));
-        assert_eq!(db.probe_index("ix"), IndexProbe::Dim(3));
+        assert_eq!(
+            db.probe_index("ix"),
+            IndexProbe::Index { dim: 3, metric: Metric::Cosine }
+        );
     }
 
     #[test]
@@ -565,7 +722,10 @@ mod tests {
         let db = Db::new();
         assert_eq!(db.probe_index("nope"), IndexProbe::Missing);
         db.vector_add("ix", vec![1.0, 0.0]).expect("setup: add must succeed");
-        assert_eq!(db.probe_index("ix"), IndexProbe::Dim(2));
+        assert_eq!(
+            db.probe_index("ix"),
+            IndexProbe::Index { dim: 2, metric: Metric::Cosine }
+        );
         db.set("s", Value::Str(b"x".to_vec())).expect("in-memory set");
         assert_eq!(db.probe_index("s"), IndexProbe::NotAnIndex);
     }
@@ -654,7 +814,10 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(db.get("a"), None); // 删除已重放
         assert_eq!(db.get("b"), Some(Value::Str(b"2".to_vec())));
-        assert_eq!(db.probe_index("ix"), IndexProbe::Dim(2));
+        assert_eq!(
+            db.probe_index("ix"),
+            IndexProbe::Index { dim: 2, metric: Metric::Cosine }
+        );
         assert_eq!(db.get_vector("ix", "0"), Ok(Some(vec![1.0, 0.0])));
         assert_eq!(db.get_vector("ix", "1"), Ok(Some(vec![0.0, 1.0])));
         // next_id 续号：重开后新 VADD 拿 "2"
@@ -770,34 +933,6 @@ mod tests {
     }
 
     #[test]
-    fn p19_replay_vadd_is_not_idempotent() {
-        // 已知边界（design.md §8「已知限制 v0.4」，非 bug）：
-        // BGSAVE 若“快照保存成功但 WAL 截断失败”，重启后快照 + WAL 重放会把
-        // 同一条 VADD 插入两次（SET/DEL/FLUSHALL 幂等，无影响）。
-        // 本测试固化该行为；修复需引入 WAL epoch（列入未来方向）。
-        let dir = temp_dir("vadd-dup");
-        {
-            let (db, _) = Db::open(&PersistConfig { dir: dir.clone() }).expect("open");
-            assert_eq!(db.vector_add("ix", vec![1.0]).expect("add"), "0");
-            db.bgsave().expect("bgsave"); // 快照已含 id "0"，WAL 被截断为空
-            // 模拟“快照成功但 WAL 截断失败”：把同一条 VADD 手工写回 WAL
-            let mut writer = WalWriter::open(&dir.join("wal.log")).expect("open wal");
-            writer
-                .append(&WalEntry::VAdd { key: "ix".into(), data: vec![1.0] })
-                .expect("append");
-            drop(writer);
-        }
-        let (db, warnings) = Db::open(&PersistConfig { dir: dir.clone() }).expect("reopen");
-        assert!(warnings.is_empty());
-        // 重放把同一条 VADD 再插一次：索引内出现 2 条向量
-        //（id "0" 来自快照，重放走正常插入路径拿到 id "1"，内容重复）
-        let mut ids = Vec::new();
-        db.for_each_vector("ix", |id, _| ids.push(id.to_string()));
-        ids.sort();
-        assert_eq!(ids, vec!["0".to_string(), "1".to_string()]);
-    }
-
-    #[test]
     fn p18_broken_readonly_bgsave_heals_and_off_bgsave_noop() {
         // （a）Broken 状态机：WAL 置 Broken 后所有写立即失败（内存未动）、读不受影响，
         //     BGSAVE 成功后自愈（design.md D11）
@@ -815,5 +950,200 @@ mod tests {
         assert!(mem.bgsave().is_ok());
         mem.set("a", Value::Str(b"1".to_vec())).expect("in-memory set");
         assert_eq!(mem.get("a"), Some(Value::Str(b"1".to_vec())));
+    }
+
+    #[test]
+    fn p19_replay_vadd_is_not_idempotent() {
+        // 已知边界（design.md §8「已知限制 v0.4」，非 bug）：
+        // BGSAVE 若“快照保存成功但 WAL 截断失败”，重启后快照 + WAL 重放会把
+        // 同一条 VADD 插入两次（SET/DEL/FLUSHALL 幂等，无影响）。
+        // 本测试固化该行为；修复需引入 WAL epoch（列入未来方向）。
+        let dir = temp_dir("vadd-dup");
+        {
+            let (db, _) = Db::open(&PersistConfig { dir: dir.clone() }).expect("open");
+            assert_eq!(db.vector_add("ix", vec![1.0]).expect("add"), "0");
+            db.bgsave().expect("bgsave"); // 快照已含 id "0"，WAL 被截断为空
+            // 模拟“快照成功但 WAL 截断失败”：把同一条 VADD 手工写回 WAL
+            let mut writer = WalWriter::open(&dir.join("wal.log")).expect("open wal");
+            writer
+                .append(&WalEntry::VAdd {
+                    key: "ix".into(),
+                    data: vec![1.0],
+                    metric: Metric::Cosine,
+                })
+                .expect("append");
+            drop(writer);
+        }
+        let (db, warnings) = Db::open(&PersistConfig { dir: dir.clone() }).expect("reopen");
+        assert!(warnings.is_empty());
+        // 重放把同一条 VADD 再插一次：索引内出现 2 条向量
+        //（id "0" 来自快照，重放走正常插入路径拿到 id "1"，内容重复）
+        let mut ids = Vec::new();
+        db.for_each_vector("ix", |id, _| ids.push(id.to_string()));
+        ids.sort();
+        assert_eq!(ids, vec!["0".to_string(), "1".to_string()]);
+    }
+
+    #[test]
+    fn v09_hnsw_disabled_falls_back() {
+        // 默认（未启用 HNSW）：写路径完全跳过索引，hnsw_search 恒为 None
+        //（第 4 步起调用方据此 fallback 暴力搜索）
+        let (db, _) = Db::open(&PersistConfig { dir: temp_dir("v09") }).expect("open");
+        db.vector_add("ix", vec![1.0, 0.0]).expect("add");
+        assert!(db.hnsw_search("ix", &[1.0, 0.0], 1, 32).is_none());
+        db.vector_add_with_metric("ix2", vec![1.0], Metric::L2).expect("add");
+        assert!(db.hnsw_search("ix2", &[1.0], 1, 32).is_none());
+    }
+
+    // —— HNSW 与持久化协同（进阶 3 第 3 步，h20–h26；open_with 启用 HNSW）——
+
+    #[test]
+    fn h20_hnsw_available_after_recovery() {
+        let dir = temp_dir("h20");
+        {
+            let (db, _) = Db::open_with(&PersistConfig { dir: dir.clone() }, true).expect("open");
+            db.vector_add("ix", vec![1.0, 0.0]).expect("add");
+            db.vector_add("ix", vec![0.0, 1.0]).expect("add");
+        } // drop：模拟进程退出
+        let (db, warnings) = Db::open_with(&PersistConfig { dir: dir.clone() }, true).expect("reopen");
+        assert!(warnings.is_empty());
+        // 恢复后 HNSW 可用：查询 = 存储向量 → top-1 对应 id、dist 0
+        let hits = db
+            .hnsw_search("ix", &[1.0, 0.0], 1, 32)
+            .expect("hnsw must exist")
+            .expect("search");
+        assert_eq!(hits[0].id, "0");
+        assert!(hits[0].dist.abs() < 1e-12);
+    }
+
+    #[test]
+    fn h21_hnsw_immediately_contains_new_vector() {
+        let (db, _) = Db::open_with(&PersistConfig { dir: temp_dir("h21") }, true).expect("open");
+        assert_eq!(db.vector_add("ix", vec![1.0, 0.0]).expect("add"), "0");
+        // 不重启：VADD 后 HNSW 立即可查
+        let hits = db
+            .hnsw_search("ix", &[1.0, 0.0], 1, 32)
+            .expect("hnsw must exist")
+            .expect("search");
+        assert_eq!(hits[0].id, "0");
+        assert!(hits[0].dist.abs() < 1e-12);
+    }
+
+    #[test]
+    fn h22_set_over_index_removes_hnsw() {
+        let (db, _) = Db::open_with(&PersistConfig { dir: temp_dir("h22") }, true).expect("open");
+        db.vector_add("ix", vec![1.0, 0.0]).expect("add");
+        assert!(db.hnsw_search("ix", &[1.0, 0.0], 1, 32).is_some());
+        db.set("ix", Value::Str(b"now-string".to_vec())).expect("set");
+        // SET 覆盖后 HNSW 作废 → None（第 4 步 fallback 语义）
+        assert!(db.hnsw_search("ix", &[1.0, 0.0], 1, 32).is_none());
+        assert_eq!(db.get("ix"), Some(Value::Str(b"now-string".to_vec())));
+    }
+
+    #[test]
+    fn h23_del_and_flush_clear_hnsw() {
+        let (db, _) = Db::open_with(&PersistConfig { dir: temp_dir("h23") }, true).expect("open");
+        // DEL 段
+        db.vector_add("ix", vec![1.0, 0.0]).expect("add");
+        db.del(&["ix".to_string()]).expect("del");
+        assert!(db.hnsw_search("ix", &[1.0, 0.0], 1, 32).is_none());
+        // FLUSHALL 段
+        db.vector_add("ix2", vec![1.0, 0.0]).expect("add");
+        db.flush().expect("flush");
+        assert!(db.hnsw_search("ix2", &[1.0, 0.0], 1, 32).is_none());
+    }
+
+    #[test]
+    fn h24_dimension_lock_consistent_with_hnsw() {
+        let (db, _) = Db::open_with(&PersistConfig { dir: temp_dir("h24") }, true).expect("open");
+        db.vector_add("ix", vec![1.0, 0.0]).expect("add");
+        // 维度锁定：3 维插入失败
+        assert!(matches!(
+            db.vector_add("ix", vec![1.0, 0.0, 0.0]),
+            Err(AddVectorError::DimensionMismatch(2))
+        ));
+        // HNSW 不受失败插入影响：2 维查询照常
+        let hits = db
+            .hnsw_search("ix", &[1.0, 0.0], 1, 32)
+            .expect("hnsw must exist")
+            .expect("search");
+        assert_eq!(hits[0].id, "0");
+        // 3 维查询 → HNSW 维度校验 Some(Err)
+        assert!(matches!(
+            db.hnsw_search("ix", &[1.0, 0.0, 0.0], 1, 32),
+            Some(Err(_))
+        ));
+    }
+
+    #[test]
+    fn h25_metric_param_and_default() {
+        let (db, _) = Db::open_with(&PersistConfig { dir: temp_dir("h25") }, true).expect("open");
+        // 缺省 vector_add → Cosine
+        db.vector_add("dflt", vec![1.0]).expect("add");
+        match db.get("dflt") {
+            Some(Value::VectorIndex { metric, .. }) => assert_eq!(metric, Metric::Cosine),
+            other => panic!("expected vector index, got {other:?}"),
+        }
+        // vector_add_with_metric → 指定 metric
+        db.vector_add_with_metric("l2ix", vec![1.0], Metric::L2).expect("add");
+        match db.get("l2ix") {
+            Some(Value::VectorIndex { metric, .. }) => assert_eq!(metric, Metric::L2),
+            other => panic!("expected vector index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn h26_metric_persisted_and_hnsw_semantics() {
+        // 数据设计：A=[1,0], B=[10,0], C=[0.5,0.5]，Q=[1,0]
+        // cos top-2 = {A, B}（同向距离 0）；l2 top-2 = {A, C}（0 与 0.707）——排序不同，
+        // 证明 HNSW 真的按索引锁定的 metric 工作
+        let dir = temp_dir("h26");
+        let a = vec![1.0, 0.0];
+        let b = vec![10.0, 0.0];
+        let c = vec![0.5, 0.5];
+        {
+            let (db, _) = Db::open_with(&PersistConfig { dir: dir.clone() }, true).expect("open");
+            assert_eq!(
+                db.vector_add_with_metric("ix", a.clone(), Metric::L2).expect("add"),
+                "0"
+            );
+            assert_eq!(
+                db.vector_add_with_metric("ix", b.clone(), Metric::L2).expect("add"),
+                "1"
+            );
+            assert_eq!(
+                db.vector_add_with_metric("ix", c.clone(), Metric::L2).expect("add"),
+                "2"
+            );
+            db.bgsave().expect("bgsave");
+        }
+        let (db, _) = Db::open_with(&PersistConfig { dir: dir.clone() }, true).expect("reopen");
+        // metric 经快照持久化保持 L2
+        match db.get("ix") {
+            Some(Value::VectorIndex { metric, .. }) => assert_eq!(metric, Metric::L2),
+            other => panic!("expected vector index, got {other:?}"),
+        }
+        // l2 语义 top-2 = A, C（id "0","2"）；ef=64 ≥ 3 ⇒ 精确
+        let hits = db
+            .hnsw_search("ix", &[1.0, 0.0], 2, 64)
+            .expect("hnsw must exist")
+            .expect("search");
+        let got: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+        assert_eq!(got, vec!["0".to_string(), "2".to_string()]);
+        // 对照：同数据 cos 暴力 top-2 = A, B（id "0","1"）——两种 metric 排序确实不同
+        let points = [("0".to_string(), a), ("1".to_string(), b), ("2".to_string(), c)];
+        let mut cos_scored: Vec<(f64, &str)> = points
+            .iter()
+            .map(|(id, v)| (distance(Metric::Cosine, &[1.0, 0.0], v), id.as_str()))
+            .collect();
+        cos_scored.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let cos_top2: Vec<String> =
+            cos_scored.into_iter().take(2).map(|(_, id)| id.to_string()).collect();
+        assert_eq!(cos_top2, vec!["0".to_string(), "1".to_string()]);
+        assert_ne!(
+            cos_top2,
+            vec!["0".to_string(), "2".to_string()],
+            "test data must discriminate l2 vs cos ordering"
+        );
     }
 }

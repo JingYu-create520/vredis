@@ -59,6 +59,24 @@ docker compose logs -f
 | `VDIM key` | 返回索引维度；索引不存在返回 nil |
 | `VSEARCH key k v1 ... vdim [METRIC cos\|l2\|dot]` | 在索引内暴力搜索 top-k，返回扁平 `[id, 距离, ...]` 升序；默认 `cos`；距离越小越相似 |
 
+### 搜索引擎与 HNSW
+
+VSEARCH 默认使用**暴力搜索**（O(N) 全量扫描，精确结果）。设置环境变量
+`VREDIS_HNSW=1` 启用自研 HNSW 近似索引（O(log N) 图遍历）：
+
+```yaml
+# docker-compose 示例
+services:
+  vredis:
+    environment:
+      - VREDIS_HNSW=1
+```
+
+- metric 一致性：查询 metric 与索引 metric（VADD 时锁定，缺省 cos）一致才走 HNSW；
+  不一致自动回落暴力搜索，保证正确性。
+- 召回率实测（m=16, ef_construction=200, ef=100）：1k 点与 10k 点 recall@10 均为
+  **1.0000**。
+
 ## 真实会话记录 / 协议实测
 
 > 本机无 redis-cli。以下为 **PowerShell TCP 客户端驱动真实 `vredis.exe`（127.0.0.1:6379）的实测记录**，
@@ -144,12 +162,19 @@ S> -WRONGTYPE Operation against a key holding the wrong kind of value |
 - Rust 1.98+（edition 2021；在 1.98.1 stable GNU 上开发验证）
 - 无其他依赖，Windows / Linux / macOS 均可构建
 
+## 持久化
+
+- 数据目录：可执行文件所在目录下的 `data/`（Docker 镜像内为 `/app/data`），自动创建。
+- 写路径先写 WAL 再改内存；`BGSAVE` 同步落快照（fsync + 原子替换）并截断 WAL。
+- 启动时加载快照 + 重放 WAL；快照/WAL 损坏会明确报错退出，绝不静默丢数据。
+- **破坏性变更（v0.4.0）**：快照格式升级 v1→v2、WAL 记录带 metric——
+  v0.2.0 及更早的 `data/` 目录不兼容，启动会明确报错，请删除后重新写入。
+
 ## Roadmap / Known Limitations
 
 以下为记录在案的未来方向，当前均未实现：
 
-- HNSW 近似最近邻索引
-- Benchmark（10 万 / 100 万向量 QPS 与召回率）
+- Benchmark（10 万 / 100 万 向量 QPS 与召回率）
 - 分片锁替代单把 Mutex
 - VDEL（删除索引内单条向量）
 - Graceful shutdown

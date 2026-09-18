@@ -18,8 +18,10 @@ use crate::storage::Value;
 
 /// 快照 magic："VRDB"（Vredis DataBase）。
 const MAGIC: u32 = 0x56_52_44_42;
-/// 快照格式版本。
-const VERSION: u32 = 1;
+/// 快照格式版本。v2（v0.3.0）：VectorIndex 携带 metric 字节。
+/// v1（v0.2.0）不再兼容——读旧版返回 `VersionIncompatible`，
+/// 提示用户删除/迁移数据目录（design.md §3.1）。
+const VERSION: u32 = 2;
 
 /// 把整库写入 `path`。调用方（Db::bgsave）持有引擎锁期间调用，保证一致性。
 ///
@@ -74,7 +76,11 @@ pub fn load(path: &Path) -> Result<HashMap<String, Value>, PersistError> {
         return Err(corrupt("快照 magic 不符"));
     }
     if le_u32(&data[4..8]) != VERSION {
-        return Err(corrupt(&format!("快照版本不兼容: {}", le_u32(&data[4..8]))));
+        return Err(PersistError::VersionIncompatible(format!(
+            "快照版本 {} 与当前 {} 不兼容",
+            le_u32(&data[4..8]),
+            VERSION
+        )));
     }
     // 尾校验：最后 4 字节是此前全部字节的 FNV-1a
     let (body, tail) = data.split_at(data.len() - 4);
@@ -101,6 +107,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::vector::Metric;
 
     /// 唯一临时文件路径（测试辅助）。
     fn temp_file(tag: &str) -> PathBuf {
@@ -119,6 +126,7 @@ mod tests {
             "ix".to_string(),
             Value::VectorIndex {
                 dim: 2,
+                metric: Metric::L2,
                 vectors: [("0".to_string(), vec![1.0, -2.5]), ("1".to_string(), vec![0.0, 3.25])]
                     .into_iter()
                     .collect(),
@@ -171,5 +179,20 @@ mod tests {
         assert_eq!(loaded, map);
         // rename 生效后不应残留临时文件
         assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn p20_snapshot_v1_is_rejected() {
+        // v0.2.0 的快照（VERSION 1）不再兼容：读旧版必须响亮报
+        // VersionIncompatible（main 据此提示删除/迁移数据目录，不静默错读）
+        let path = temp_file("snapshot.v1.vrdb");
+        let mut data = vec![0u8; 16];
+        data[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&1u32.to_le_bytes()); // 旧版本号
+        std::fs::write(&path, &data).expect("write");
+        assert!(matches!(
+            load(&path),
+            Err(PersistError::VersionIncompatible(_))
+        ));
     }
 }

@@ -198,6 +198,7 @@ mod tests {
 
     use super::*;
     use crate::command::execute;
+    use crate::vector::Metric;
 
     /// 把字符串数组构造为 RESP2 数组形式请求（测试辅助）。
     fn arr<const N: usize>(args: [&str; N]) -> Vec<RespValue> {
@@ -216,7 +217,7 @@ mod tests {
     }
 
     fn vec_index(dim: usize) -> Value {
-        Value::VectorIndex { dim, vectors: HashMap::new(), next_id: 0 }
+        Value::VectorIndex { dim, metric: Metric::Cosine, vectors: HashMap::new(), next_id: 0 }
     }
 
     /// 断言结果为 Array 且全部是 Bulk，排序后返回（KEYS 顺序不保证）。

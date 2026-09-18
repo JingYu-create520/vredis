@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::storage::Value;
+use crate::vector::Metric;
 
 /// 持久化配置：数据目录。
 #[derive(Debug, Clone)]
@@ -59,10 +60,13 @@ pub(crate) fn wal_file_in(dir: &Path) -> PathBuf {
 ///
 /// - `Io`：读写失败（含磁盘满等）；写路径收到它必须让操作失败（design.md D11）。
 /// - `Corrupt`：数据损坏（magic/校验和/结构非法）；启动恢复遇到必须拒绝启动。
+/// - `VersionIncompatible`：数据来自不兼容的旧格式版本（如 v0.2.0 的快照 v1）；
+///   启动时提示用户删除/迁移数据目录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PersistError {
     Io(String),
     Corrupt(String),
+    VersionIncompatible(String),
 }
 
 impl std::fmt::Display for PersistError {
@@ -70,6 +74,7 @@ impl std::fmt::Display for PersistError {
         match self {
             PersistError::Io(msg) => write!(f, "{msg}"),
             PersistError::Corrupt(msg) => write!(f, "数据损坏: {msg}"),
+            PersistError::VersionIncompatible(msg) => write!(f, "格式版本不兼容: {msg}"),
         }
     }
 }
@@ -191,8 +196,10 @@ pub fn encode_value(buf: &mut Vec<u8>, value: &Value) {
             buf.push(0x01);
             put_bytes(buf, data);
         }
-        Value::VectorIndex { dim, vectors, next_id } => {
+        Value::VectorIndex { dim, metric, vectors, next_id } => {
             buf.push(0x02);
+            // v0.3.0 起索引携带 metric（HNSW 建图锁定用）；编码见 Metric::as_u8
+            buf.push(metric.as_u8());
             put_u32(buf, *dim as u32);
             put_u64(buf, *next_id);
             put_u32(buf, vectors.len() as u32);
@@ -219,6 +226,10 @@ pub(crate) fn decode_value(cur: &mut Cursor<'_>) -> Result<Value, PersistError> 
             Ok(Value::Str(data.to_vec()))
         }
         Some(0x02) => {
+            let metric = cur
+                .read_u8()
+                .and_then(Metric::from_u8)
+                .ok_or_else(|| corrupt("未知/缺失的索引度量编码"))?;
             let dim = cur.read_u32().ok_or_else(|| corrupt("索引维度不完整"))? as usize;
             if dim as u32 > MAX_VECTOR_DIM {
                 return Err(corrupt(&format!("索引维度 {dim} 超过上限 {MAX_VECTOR_DIM}")));
@@ -246,7 +257,7 @@ pub(crate) fn decode_value(cur: &mut Cursor<'_>) -> Result<Value, PersistError> 
                 }
                 vectors.insert(id, data);
             }
-            Ok(Value::VectorIndex { dim, vectors, next_id })
+            Ok(Value::VectorIndex { dim, metric, vectors, next_id })
         }
         _ => Err(corrupt("未知的值类型码")),
     }

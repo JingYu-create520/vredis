@@ -181,8 +181,15 @@ pub enum PersistError { Io(String), Corrupt(String) }
 - 数据目录：`<可执行文件所在目录>/data/`，含 `wal.log` 与 `snapshot.vrdb`；不存在自动创建。测试注入临时目录（`PersistConfig`）。
 - WAL 格式：`记录 = magic "VRLE"(4B) | payload_len(4B) | FNV-1a 校验和(4B) | payload`。payload = 操作码(1B) + 内容；`SET` 记录**完整 Value**（复用快照的 Value 编码——SET 可覆盖向量索引，重放必须还原整值）；`DEL` 记录整批 key；`VADD` 记录 key + f32 分量。
 - 快照格式：`"VRDB" | version(4B) | 条目数(4B) | 条目×N（key + Value 编码）| 全体 FNV-1a 尾校验`；写入 `snapshot.tmp` → fsync → 原子 rename 到 `snapshot.vrdb`。
+  - **v0.4.0 起版本 2**：VectorIndex 编码携带 metric 字节（0=cos, 1=l2, 2=dot；未来新增度量追加到末尾 3, 4, ...，不改已有编码）。读 v1 → `VersionIncompatible`（main 提示删除/迁移数据目录）。
+  - WAL 的 VADD 记录同步 +metric 字节。旧 WAL 无版本头：旧格式解析失败与位翻转损坏无法可靠区分，统一按 Corrupt 响亮报错——理论上存在极小概率错位解析，pre-1.0 开发期数据可弃，接受此风险。
 - 恢复流程：加载快照（若有）→ 逐条重放 WAL（重放期间 WAL 状态 Off，重放不写日志）→ 撕裂尾截断（若有）→ 打开追加 writer。**恢复后 WAL 原样保留**（只截撕裂尾）——清空会在下次崩溃且无新快照时丢数据；仅 BGSAVE 成功后截断 WAL。
 - BGSAVE：同步实现（无后台线程）；引擎锁内序列化整库 → 原子替换快照 → 截断重开 WAL；`Broken` 状态借此自愈。
+- HNSW 集成（进阶 3 第 4 步）：VSEARCH 分发语义——查询 metric == 索引 metric 且
+  `VREDIS_HNSW=1`（仅 "1"/"true" 启用，默认关闭）→ 走 HNSW（搜索宽度固定
+  `HNSW_DEFAULT_SEARCH_EF=100`）；metric 不匹配或 HNSW 不可用 → 暴力搜索
+  （正确性优先，绝不用错 metric 的图）。HNSW 不持久化，启动时按 id 数值序重建
+  （seed = fnv1a(key) 确定性，重建图与崩溃前一致）。
 - Range 前缀：WAL/快照校验和统一 FNV-1a 32 位（std 手写 ~10 行，零依赖）。
 
 ---
@@ -260,6 +267,34 @@ VSEARCH 语义细则（必须在文档与注释中写明）：
 | 协议损坏 | `-ERR Protocol error ...` 后**断开连接**（与 Redis 一致） |
 
 请求格式：完整支持 RESP2 数组形式；同时支持**简化 inline 命令**（空格分隔、无引号处理），便于 `nc` 手测。redis-cli 始终使用数组形式。
+
+### 4.4 搜索引擎：HNSW 与暴力对照（进阶 3）
+
+**算法概述**（Malkov & Yashunin 2016，自研零依赖实现，含 SplitMix64 PRNG）：
+- 分层图：层 0 包含全部向量（保证可达性），层 l>0 为指数递减「高速公路」子集（`P(level ≥ l) = m^(-l)`）；
+- 插入：随机层抽样（`floor(−ln(u)×mL)`，`mL=1/ln(m)`）→ 贪心下降 → 逐层 `search_layer(ef_construction)` → 前 m 个双向连接 + 超限按距离裁剪；
+- 搜索：贪心降底 → 层 0 以 ef 宽度收集 top-k（论文 Algorithm 2：候选最小堆 + 结果最大堆 + visited 集合）。
+
+**数据结构**：`HnswNode { id, neighbors: Vec<Vec<usize>> }`（层数 = len−1，单一事实来源）；
+`HnswIndex { nodes, vectors（向量副本）, entry_point, top_level, metric, m, m_max0=2m, ef_construction, rng }`。
+MVP 取舍：向量在 Db 与索引双存（空间换实现简单）；邻居超限用简单距离截断（论文启发式选择列为未来优化）。
+
+**参数与实测**：m=16、ef_construction=200、搜索 ef 默认 100（`HNSW_DEFAULT_SEARCH_EF`）。
+召回率实测（10 维均匀随机、recall@10、暴力对照）：**1k 点 = 1.0000（h11）、10k 点 = 1.0000（h12，#[ignore]）**。
+
+**复杂度**：插入 O(log N × ef_construction × m) 次距离计算；搜索 O(log N × ef)；对照暴力 O(N × dim)。
+
+**metric 约束**：索引创建时锁定（VADD 可选 `METRIC`，缺省 cos）；VSEARCH 查询 metric ==
+索引 metric → 走 HNSW；不等 → 暴力搜索（绝不用错 metric 的图）。`hnsw_search` 不接收 metric 参数。
+
+**与暴力搜索的关系**：环境变量 `VREDIS_HNSW`（仅 `1`/`true` 启用，默认关闭 = 纯暴力）；
+未启用时零 HNSW 内存与建图开销；两条路径响应格式完全一致，客户端无感。
+
+**已知限制**：
+- seed 决定图结构（同 seed 同数据可复现，h18/h19 验证）；
+- 图不持久化，启动时按 id 数值序 + 确定性 seed 重建（10k 点 debug 构建秒级量级——
+  估算值；参照点：h12 全量插入含逐条 WAL 写为 28.3s，纯重建无 WAL 摊销显著更小，release 再快一个量级）；
+- 无单向量删除（VDEL 在 Roadmap）；并列距离的返回顺序不保证（h26/t41 数据设计已规避）。
 
 ---
 

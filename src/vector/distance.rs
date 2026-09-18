@@ -18,6 +18,26 @@ impl Metric {
             _ => None,
         }
     }
+
+    /// 线格式编码（WAL / 快照）：0 = Cosine, 1 = L2, 2 = Dot。
+    /// 未来新增度量**追加到末尾**（3, 4, ...），绝不改变已有编码。
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Metric::Cosine => 0,
+            Metric::L2 => 1,
+            Metric::Dot => 2,
+        }
+    }
+
+    /// 线格式解码；未知字节 → None（上层转 Corrupt，响亮拒绝）。
+    pub fn from_u8(byte: u8) -> Option<Metric> {
+        match byte {
+            0 => Some(Metric::Cosine),
+            1 => Some(Metric::L2),
+            2 => Some(Metric::Dot),
+            _ => None,
+        }
+    }
 }
 
 /// 计算两向量的距离（**越小越相似**）。

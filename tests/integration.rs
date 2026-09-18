@@ -15,6 +15,7 @@ use vredis::net::{accept_loop, bind};
 use vredis::persist::PersistConfig;
 use vredis::protocol::{parse, ParseOutcome, RespValue};
 use vredis::storage::{Db, Value};
+use vredis::vector::Metric;
 
 /// 起一个临时端口的服务器，返回实际端口；accept 循环在后台线程运行。
 fn spawn_server() -> u16 {
@@ -26,9 +27,11 @@ fn spawn_server() -> u16 {
     port
 }
 
-/// 起一个真实 TCP 服务器（“进程 B”）：Db::open(dir) 恢复 + accept_loop，返回端口。
-fn spawn_server_with_dir(dir: PathBuf) -> u16 {
-    let (db, warnings) = Db::open(&PersistConfig { dir }).expect("open with recovery");
+/// 起一个真实 TCP 服务器（“进程 B”）：Db::open_with(dir, hnsw_enabled) 恢复
+/// + accept_loop，返回端口。
+fn spawn_server_with_dir(dir: PathBuf, hnsw_enabled: bool) -> u16 {
+    let (db, warnings) =
+        Db::open_with(&PersistConfig { dir }, hnsw_enabled).expect("open with recovery");
     assert!(warnings.is_empty(), "unexpected recovery warnings: {warnings:?}");
     let listener = bind(&ServerConfig { host: "127.0.0.1".to_string(), port: 0 })
         .expect("bind on port 0 must succeed");
@@ -594,8 +597,8 @@ fn t37_restart_persistence_full_tcp_chain() {
         assert_eq!(db.vector_add("ix", vec![1.0, 0.0]).expect("add"), "0");
         assert_eq!(db.vector_add("ix", vec![0.0, 1.0]).expect("add"), "1");
     } // drop：释放 WAL 句柄，模拟进程退出
-    // 进程 B：真实 TCP 服务器（Db::open 恢复 + accept_loop），通过连接验证数据
-    let port = spawn_server_with_dir(dir);
+    // 进程 B：真实 TCP 服务器（Db::open_with 恢复 + accept_loop），通过连接验证数据
+    let port = spawn_server_with_dir(dir, false);
     let mut c = TestClient::connect(port);
     // SET 的 key 拿到了
     c.send(&resp(&["GET", "a"]));
@@ -626,7 +629,7 @@ fn t38_bgsave_recovers_snapshot_plus_wal() {
         db.set("y", Value::Str(b"2".to_vec())).expect("set y");
     }
     // 进程 B：真实 TCP 服务器（快照 + WAL 组合恢复）
-    let port = spawn_server_with_dir(dir);
+    let port = spawn_server_with_dir(dir, false);
     let mut c = TestClient::connect(port);
     c.send(&resp(&["GET", "x"]));
     assert_eq!(c.read_reply(), RespValue::Bulk(b"1".to_vec())); // 来自快照
@@ -646,4 +649,92 @@ fn t39_bgsave_arity_error() {
     );
     c.send(&resp(&["PING"]));
     assert_eq!(c.read_reply(), RespValue::Simple("PONG".into()));
+}
+
+// —— HNSW 集成测试（进阶 3 第 4 步）——
+
+#[test]
+fn t40_vsearch_hnsw_path_correct() {
+    // HNSW 启用 + metric 匹配（l2 索引 + METRIC l2）→ VSEARCH 走 HNSW 路径，
+    // 结果与暴力一致（同 h26 数据：l2 top-2 = A, C）
+    let dir = temp_data_dir("t40");
+    {
+        let (db, _) = Db::open_with(&PersistConfig { dir: dir.clone() }, true).expect("open A");
+        assert_eq!(
+            db.vector_add_with_metric("ix", vec![1.0, 0.0], Metric::L2).expect("add"),
+            "0"
+        );
+        assert_eq!(
+            db.vector_add_with_metric("ix", vec![10.0, 0.0], Metric::L2).expect("add"),
+            "1"
+        );
+        assert_eq!(
+            db.vector_add_with_metric("ix", vec![0.5, 0.5], Metric::L2).expect("add"),
+            "2"
+        );
+    }
+    let port = spawn_server_with_dir(dir, true);
+    let mut c = TestClient::connect(port);
+    c.send(&resp(&["VSEARCH", "ix", "2", "1.0", "0.0", "METRIC", "l2"]));
+    let (ids, dists) = flat_search_reply(c.read_reply());
+    assert_eq!(ids, vec!["0", "2"]);
+    assert!(dists[0].abs() < 1e-12);
+    assert!((dists[1] - 0.5f64.sqrt()).abs() < 1e-12);
+}
+
+#[test]
+fn t41_vsearch_metric_mismatch_falls_back_to_brute() {
+    // l2 索引 + 查询 METRIC cos → metric 不匹配 → 暴力路径（cos 语义 top-2 = A, B），
+    // 绝不使用错 metric 的 HNSW 图（design.md 补充 3）。
+    // 注：B 取 [1, 0.2] 而非与 A 同向——并列距离（同为 0）的堆弹出顺序未定义，
+    // 测试数据必须避免并列，否则断言不稳定
+    let dir = temp_data_dir("t41");
+    {
+        let (db, _) = Db::open_with(&PersistConfig { dir: dir.clone() }, true).expect("open A");
+        assert_eq!(
+            db.vector_add_with_metric("ix", vec![1.0, 0.0], Metric::L2).expect("add"),
+            "0"
+        );
+        assert_eq!(
+            db.vector_add_with_metric("ix", vec![1.0, 0.2], Metric::L2).expect("add"),
+            "1"
+        );
+        assert_eq!(
+            db.vector_add_with_metric("ix", vec![0.5, 0.5], Metric::L2).expect("add"),
+            "2"
+        );
+    }
+    let port = spawn_server_with_dir(dir, true);
+    let mut c = TestClient::connect(port);
+    c.send(&resp(&["VSEARCH", "ix", "2", "1.0", "0.0", "METRIC", "cos"]));
+    let (ids, dists) = flat_search_reply(c.read_reply());
+    assert_eq!(ids, vec!["0", "1"]);
+    assert!(dists[0].abs() < 1e-12);
+    assert!(dists[1] > 0.0 && dists[1] < 0.1); // B 的 cos 距离 ≈ 0.0194
+}
+
+#[test]
+fn t42_hnsw_rebuilt_after_restart() {
+    // 进程 A（HNSW 启用，文件层写入）→ drop → 进程 B（HNSW 启用，真实 TCP）：
+    // 重启后索引重建，VSEARCH 走 HNSW 路径结果正确
+    let dir = temp_data_dir("t42");
+    {
+        let (db, warnings) = Db::open_with(&PersistConfig { dir: dir.clone() }, true).expect("open A");
+        assert!(warnings.is_empty());
+        assert_eq!(
+            db.vector_add_with_metric("ix", vec![1.0, 0.0], Metric::L2).expect("add"),
+            "0"
+        );
+        assert_eq!(
+            db.vector_add_with_metric("ix", vec![0.0, 1.0], Metric::L2).expect("add"),
+            "1"
+        );
+    } // drop：模拟进程退出
+    let port = spawn_server_with_dir(dir, true);
+    let mut c = TestClient::connect(port);
+    c.send(&resp(&["VSEARCH", "ix", "2", "1.0", "0.0", "METRIC", "l2"]));
+    let (ids, dists) = flat_search_reply(c.read_reply());
+    assert_eq!(ids, vec!["0", "1"]);
+    assert!(dists[0].abs() < 1e-12);
+    assert!((dists[1] - 2.0f64.sqrt()).abs() < 1e-12);
 }

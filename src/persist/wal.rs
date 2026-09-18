@@ -17,6 +17,7 @@ use super::{
     MAX_KEYS_PER_DEL, MAX_VECTOR_DIM, PersistError,
 };
 use crate::storage::Value;
+use crate::vector::Metric;
 
 /// WAL 记录 magic："VRLE"（Vredis Log Entry）。
 const MAGIC: u32 = 0x56_52_4C_45;
@@ -30,12 +31,13 @@ const OP_VADD: u8 = 0x04;
 ///
 /// `Set` 携带**完整 Value**（复用快照的值编解码）：SET 可以覆盖向量索引，
 /// 只有记录整值才能保证重放后状态与崩溃前一致。
+/// `VAdd` 携带 metric（v0.3.0）：重放建 HNSW 时必须知道索引锁定的度量。
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalEntry {
     Set { key: String, value: Value },
     Del { keys: Vec<String> },
     FlushAll,
-    VAdd { key: String, data: Vec<f32> },
+    VAdd { key: String, data: Vec<f32>, metric: Metric },
 }
 
 impl WalEntry {
@@ -56,9 +58,11 @@ impl WalEntry {
                 }
             }
             WalEntry::FlushAll => buf.push(OP_FLUSH_ALL),
-            WalEntry::VAdd { key, data } => {
+            WalEntry::VAdd { key, data, metric } => {
                 buf.push(OP_VADD);
                 put_str(&mut buf, key);
+                // v0.3.0：VADD 记录携带 metric（重放建 HNSW 用）
+                buf.push(metric.as_u8());
                 put_u32(&mut buf, data.len() as u32);
                 for f in data {
                     buf.extend_from_slice(&f.to_le_bytes());
@@ -94,6 +98,13 @@ impl WalEntry {
             Some(OP_FLUSH_ALL) => WalEntry::FlushAll,
             Some(OP_VADD) => {
                 let key = cur.read_str().ok_or_else(|| corrupt("VADD 条目 key 不完整"))?;
+                // v0.3.0：metric 字节。旧版 WAL（无此字节）在此解析错位 →
+                // 极大概率命中非法 metric 或长度不匹配 → 响亮 Corrupt；
+                // 理论上存在极小概率错位解析，pre-1.0 开发期数据可弃，接受此风险
+                let metric = cur
+                    .read_u8()
+                    .and_then(Metric::from_u8)
+                    .ok_or_else(|| corrupt("VADD 条目度量编码非法"))?;
                 let dim = cur.read_u32().ok_or_else(|| corrupt("VADD 条目维度不完整"))? as usize;
                 // 与 decode_value 同类防御：损坏的超大 dim 不得触发超大 Vec 预分配
                 if dim as u32 > MAX_VECTOR_DIM {
@@ -103,7 +114,7 @@ impl WalEntry {
                 for _ in 0..dim {
                     data.push(cur.read_f32().ok_or_else(|| corrupt("VADD 条目分量不完整"))?);
                 }
-                WalEntry::VAdd { key, data }
+                WalEntry::VAdd { key, data, metric }
             }
             _ => return Err(corrupt("未知的 WAL 操作码")),
         };
@@ -226,13 +237,14 @@ mod tests {
                 key: "ix".into(),
                 value: Value::VectorIndex {
                     dim: 2,
+                    metric: Metric::L2,
                     vectors: [("0".into(), vec![1.0, 2.0])].into_iter().collect(),
                     next_id: 7,
                 },
             },
             WalEntry::Del { keys: vec!["a".into(), "b".into()] },
             WalEntry::FlushAll,
-            WalEntry::VAdd { key: "ix".into(), data: vec![1.5, -2.0, 0.0] },
+            WalEntry::VAdd { key: "ix".into(), data: vec![1.5, -2.0, 0.0], metric: Metric::L2 },
         ];
         for entry in entries {
             let payload = entry.payload();
@@ -246,7 +258,7 @@ mod tests {
         let mut writer = WalWriter::open(&path).expect("open");
         let entries = vec![
             WalEntry::Set { key: "a".into(), value: Value::Str(b"1".to_vec()) },
-            WalEntry::VAdd { key: "ix".into(), data: vec![1.0, 0.0] },
+            WalEntry::VAdd { key: "ix".into(), data: vec![1.0, 0.0], metric: Metric::L2 },
             WalEntry::Del { keys: vec!["a".into()] },
         ];
         for entry in &entries {

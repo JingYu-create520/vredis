@@ -89,12 +89,14 @@ pub fn search(
     metric: Metric,
 ) -> Result<Vec<Hit>, SearchError> {
     debug_assert!(k >= 1, "k >= 1 is validated at the command layer");
-    // 前置校验：存在性 + 维度（短临界区）
+    // 前置校验：存在性 + 维度（短临界区）。
+    // （IndexProbe::Dim → Index { dim, metric } 为进阶 3 第 4 步的枚举扩展，
+    //   本函数仅机械适配变体名，暴力搜索逻辑零改动）
     match db.probe_index(index) {
         IndexProbe::Missing => return Err(SearchError::IndexMissing),
         IndexProbe::NotAnIndex => return Err(SearchError::WrongType),
-        IndexProbe::Dim(dim) if dim == query.len() => {}
-        IndexProbe::Dim(dim) => return Err(SearchError::DimensionMismatch(dim)),
+        IndexProbe::Index { dim, .. } if dim == query.len() => {}
+        IndexProbe::Index { dim, .. } => return Err(SearchError::DimensionMismatch(dim)),
     }
     // 遍历 + top-k 收集：闭包在 for_each_vector 的持锁临界区内执行
     let mut topk = TopK::new(k);
