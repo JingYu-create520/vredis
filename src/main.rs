@@ -31,13 +31,13 @@ fn main() {
         }
         Err(e) => {
             eprintln!("[vredis] 数据恢复失败: {e}");
-            // 版本不兼容（v0.3.0 起快照 v2 / WAL VADD 带 metric）与数据损坏
+            // 版本不兼容（v0.4.0 起快照 v2 / WAL VADD 带 metric）与数据损坏
             // 都提示删除/迁移数据目录。已知取舍：旧 WAL 解析失败与位翻转损坏
             // 无法可靠区分，统一提示（后者同样以删除/恢复兜底）。
             match e {
                 PersistError::VersionIncompatible(_) | PersistError::Corrupt(_) => {
                     eprintln!(
-                        "[vredis] 提示：v0.3.0 起快照格式升级（v1→v2），旧数据目录不兼容。"
+                        "[vredis] 提示：v0.4.0 起快照格式升级（v1→v2），旧数据目录不兼容。"
                     );
                     eprintln!(
                         "[vredis] 请删除 {}/ 后重启；或从备份中恢复数据。",

@@ -198,7 +198,7 @@ pub fn encode_value(buf: &mut Vec<u8>, value: &Value) {
         }
         Value::VectorIndex { dim, metric, vectors, next_id } => {
             buf.push(0x02);
-            // v0.3.0 起索引携带 metric（HNSW 建图锁定用）；编码见 Metric::as_u8
+            // v0.4.0 起索引携带 metric（HNSW 建图锁定用）；编码见 Metric::as_u8
             buf.push(metric.as_u8());
             put_u32(buf, *dim as u32);
             put_u64(buf, *next_id);

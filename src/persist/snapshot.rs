@@ -18,7 +18,7 @@ use crate::storage::Value;
 
 /// 快照 magic："VRDB"（Vredis DataBase）。
 const MAGIC: u32 = 0x56_52_44_42;
-/// 快照格式版本。v2（v0.3.0）：VectorIndex 携带 metric 字节。
+/// 快照格式版本。v2（v0.4.0）：VectorIndex 携带 metric 字节。
 /// v1（v0.2.0）不再兼容——读旧版返回 `VersionIncompatible`，
 /// 提示用户删除/迁移数据目录（design.md §3.1）。
 const VERSION: u32 = 2;

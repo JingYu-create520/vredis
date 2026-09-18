@@ -31,7 +31,7 @@ const OP_VADD: u8 = 0x04;
 ///
 /// `Set` 携带**完整 Value**（复用快照的值编解码）：SET 可以覆盖向量索引，
 /// 只有记录整值才能保证重放后状态与崩溃前一致。
-/// `VAdd` 携带 metric（v0.3.0）：重放建 HNSW 时必须知道索引锁定的度量。
+/// `VAdd` 携带 metric（v0.4.0）：重放建 HNSW 时必须知道索引锁定的度量。
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalEntry {
     Set { key: String, value: Value },
@@ -61,7 +61,7 @@ impl WalEntry {
             WalEntry::VAdd { key, data, metric } => {
                 buf.push(OP_VADD);
                 put_str(&mut buf, key);
-                // v0.3.0：VADD 记录携带 metric（重放建 HNSW 用）
+                // v0.4.0：VADD 记录携带 metric（重放建 HNSW 用）
                 buf.push(metric.as_u8());
                 put_u32(&mut buf, data.len() as u32);
                 for f in data {
@@ -98,7 +98,7 @@ impl WalEntry {
             Some(OP_FLUSH_ALL) => WalEntry::FlushAll,
             Some(OP_VADD) => {
                 let key = cur.read_str().ok_or_else(|| corrupt("VADD 条目 key 不完整"))?;
-                // v0.3.0：metric 字节。旧版 WAL（无此字节）在此解析错位 →
+                // v0.4.0：metric 字节。旧版 WAL（无此字节）在此解析错位 →
                 // 极大概率命中非法 metric 或长度不匹配 → 响亮 Corrupt；
                 // 理论上存在极小概率错位解析，pre-1.0 开发期数据可弃，接受此风险
                 let metric = cur
