@@ -16,8 +16,11 @@ RUN mkdir src \
     && cargo build --release --locked
 
 # —— 真实源码构建：依赖层已缓存，只重编 crate 本体 ——
+# touch 强制更新 mtime：Docker COPY 保留构建上下文中的旧 mtime，
+# 占位阶段生成的 stub 比真实源码"更新"，Cargo 增量编译会因缓存跳过 lib 重编，
+# 导致 src/bin/*.rs（如 bench.rs）链接到旧 stub lib（实例：can't find `vector`）。
 COPY src ./src
-RUN cargo build --release --locked
+RUN touch src/lib.rs src/main.rs && cargo build --release --locked
 
 # 阶段 2：运行镜像
 FROM debian:bookworm-slim AS runtime
