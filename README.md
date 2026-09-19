@@ -170,11 +170,40 @@ S> -WRONGTYPE Operation against a key holding the wrong kind of value |
 - **破坏性变更（v0.4.0）**：快照格式升级 v1→v2、WAL 记录带 metric——
   v0.2.0 及更早的 `data/` 目录不兼容，启动会明确报错，请删除后重新写入。
 
+## 性能
+
+实测数据（`cargo run --release --bin bench`，固定 seed 可复现；环境：Rust 1.98.1 GNU、
+12th Gen Intel Core i5-12500H、Windows 11、32GB RAM；metric = l2，k = 10，100 查询；
+不同批次运行存在正常计时抖动）：
+
+**规模趋势**（ef_search = 100）：
+
+| 数据规模 | 暴力 QPS | HNSW QPS | 加速比 | 召回率@10 |
+|---|---|---|---|---|
+| 1k | 8356 | 5360 | 0.6× | 0.99 |
+| 10k | 646 | 1269 | 2.0× | 0.83 |
+| 50k | 98 | 974 | 9.2× | 0.54 |
+
+**ef_search 权衡**（50k × 128 维）：
+
+| ef_search | HNSW QPS | 加速比 | 召回率@10 |
+|---|---|---|---|
+| 100 | 822 | 9.2× | 0.54 |
+| 200 | 452 | 4.7× | 0.72 |
+| 400 | 262 | 3.1× | 0.84 |
+| 800 | 163 | 1.9× | 0.93 |
+
+总结：HNSW 优势随规模扩大——1k 时常数开销主导反而慢于暴力，50k 时达 **9.2×**；
+召回率可用 ef_search 换取（ef=800 时 0.93，仍比暴力快约 2×）。
+诚实说明：128 维均匀随机是图索引的**最坏情况**（真实 embedding 有簇结构时召回
+显著更高）；邻居裁剪为简单截断（论文启发式选择在 Roadmap）；小规模下 HNSW
+常数开销主导、可能慢于暴力；ef_search 需按数据规模调节。
+
 ## Roadmap / Known Limitations
 
 以下为记录在案的未来方向，当前均未实现：
 
-- Benchmark（10 万 / 100 万 向量 QPS 与召回率）
+- HNSW 邻居选择启发式（论文 Algorithm 4，提升大规模图质量与召回率）
 - 分片锁替代单把 Mutex
 - VDEL（删除索引内单条向量）
 - Graceful shutdown
